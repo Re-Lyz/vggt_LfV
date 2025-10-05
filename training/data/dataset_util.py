@@ -17,6 +17,7 @@ try:
 except AttributeError:
     lanczos = PIL.Image.LANCZOS
     bicubic = PIL.Image.BICUBIC
+import omegaconf
 
 from vggt.utils.geometry import closed_form_inverse_se3
 
@@ -709,3 +710,180 @@ def load_16big_png_depth(depth_png: str) -> np.ndarray:
             .reshape((depth_pil.size[1], depth_pil.size[0]))
         )
     return depth
+
+
+
+
+def read_depth_any(path: str, scale_adjustment: float = 1.0) -> np.ndarray:
+    """
+    兼容读取 .tiff/.tif/.exr/.png 的深度，统一转 float32，并乘以 scale_adjustment。
+    .exr/.png 可直接沿用你已有 read_depth 实现；此处把 .tiff/.tif 单独处理。
+    """
+    p = path.lower()
+    if p.endswith(".tiff") or p.endswith(".tif"):
+        d = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if d is None:
+            raise ValueError(f"Failed to read depth tiff: {path}")
+        if d.ndim == 3:
+            d = d[..., 0]
+        d = d.astype(np.float32)
+        d[~np.isfinite(d)] = 0.0
+        d *= scale_adjustment
+        return d
+    elif p.endswith(".exr"):
+        d = cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+        if d is None:
+            raise ValueError(f"Failed to read EXR depth: {path}")
+        if d.ndim == 3:
+            d = d[..., 0]
+        d = d.astype(np.float32)
+        d[d > 1e9] = 0.0
+        d[~np.isfinite(d)] = 0.0
+        d *= scale_adjustment
+        return d
+    elif p.endswith(".png"):
+        # 16-bit PNG half-float 的读取：沿用你已有实现（这里重写一版最小可用）
+        from PIL import Image
+        with Image.open(path) as depth_pil:
+            arr_u16 = np.array(depth_pil, dtype=np.uint16)
+        # 以 float16 解释，然后转 float32
+        d = np.frombuffer(arr_u16.tobytes(), dtype=np.float16).astype(np.float32)
+        d = d.reshape(arr_u16.shape)
+        d[~np.isfinite(d)] = 0.0
+        d *= scale_adjustment
+        return d
+    else:
+        raise ValueError(f"Unsupported depth extension: {path}")
+
+
+def parse_pose_row_major_4x4(line: str, assume: str = "w2c") -> np.ndarray:
+    """
+    把一行 16 个数（行主序 4×4，前三行是R，第4行前三个是t，最后一列是 [0,0,0,1]）
+    解析为 OpenCV 约定的外参（3×4）。
+
+    参数
+    ----
+    assume: 'w2c' 或 'c2w'
+      - 如果原始就是 world->camera（w2c），直接取前3行4列即可；
+      - 如果是 camera->world（c2w），需先求逆到 w2c。
+    """
+    vals = [float(x) for x in line.replace(",", " ").split()]
+    assert len(vals) == 16, f"pose line must have 16 numbers, got {len(vals)}"
+    M = np.array(vals, dtype=np.float64).reshape(4, 4)  # 行主序
+    # 构造成“我们理解”的齐次矩阵：R 在 [:3,:3]，t 在 [:3,3]
+    R = M[:3, :3].copy()
+    t_row = M[3, :3].copy()   # 第4行前三个元素
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = t_row
+
+    if assume == "c2w":
+        # 需要得到 w2c
+        T = closed_form_inverse_se3(T[None])[0]
+    elif assume != "w2c":
+        raise ValueError(f"Unknown assume mode: {assume}")
+
+    extri_w2c_3x4 = T[:3, :4]
+    return extri_w2c_3x4
+
+
+def ocam_to_pinhole_K_from_cfg(cfg: dict | "omegaconf.dictconfig.DictConfig",
+                                img_hw: tuple[int, int],
+                                *,
+                                zero_skew: bool = True) -> np.ndarray:
+    """
+    根据 config 中的 OCamCalib 样式参数 (a0,a2,a3,a4,e,f,g,cx,cy) 近轴近似生成针孔内参 K。
+    - 采用一阶线性项 a0 与仿射矩阵 [[e,f],[g,1]] 的 QR 分解得到等效 (fx, fy, skew)。
+    - 若提供了标定分辨率 (calib_width, calib_height)，自动按实际图像分辨率缩放 K。
+    - zero_skew=True 时将 skew 强制为 0（多数模型更稳），否则保留极小的 skew。
+
+    参数:
+        cfg.ocam:
+            width, height        #（可选）图像/标定分辨率，仅用于缩放
+            calib_width, calib_height  #（可选）若与上面不同，优先使用 calib_* 作为K对应的原标定分辨率
+            cx, cy               # 主点（鱼眼标定）
+            a0, a2, a3, a4       # 多项式系数（这里只用 a0 的一阶线性近似）
+            e, f, g              # 仿射：[[e,f],[g,1]]
+
+        img_hw: (H, W) 当前实际图像分辨率
+
+    返回:
+        K: (3,3) np.ndarray，近轴等效针孔内参
+    """
+    oc = cfg.get("ocam", cfg)  # 允许直接传 ocam 子dict
+
+    a0 = float(oc["a0"])
+    e  = float(oc["e"])
+    f  = float(oc["f"])
+    g  = float(oc["g"])
+    cx = float(oc["cx"])
+    cy = float(oc["cy"])
+
+    # 仿射矩阵
+    M = np.array([[e, f],
+                  [g, 1.0]], dtype=np.float64)
+
+    # QR 分解（列正交）, 调整 R 对角为正
+    Q, R = np.linalg.qr(M)
+    sgn = np.sign(np.diag(R))
+    sgn[sgn == 0] = 1.0
+    Q = Q @ np.diag(sgn)
+    R = np.diag(sgn) @ R
+
+    # 近轴等效
+    fx   = a0 * R[0, 0]
+    skew = a0 * R[0, 1]
+    fy   = a0 * R[1, 1]
+
+    if zero_skew:
+        skew = 0.0
+
+    # 选取“原始 K 对应的分辨率”用于缩放
+    # 优先 calib_*，否则 width/height，否则用当前图像尺寸（不缩放）
+    H_img, W_img = img_hw
+    W0 = oc.get("calib_width",  oc.get("width",  W_img))
+    H0 = oc.get("calib_height", oc.get("height", H_img))
+    W0 = float(W0); H0 = float(H0)
+
+    # 按分辨率缩放到当前图像尺寸
+    sx = W_img / W0
+    sy = H_img / H0
+    fx   *= sx
+    skew *= sx
+    fy   *= sy
+    cx   *= sx
+    cy   *= sy
+
+    K = np.array([[fx,  skew, cx],
+                  [0.,  fy,   cy],
+                  [0.,  0.,   1.]], dtype=np.float64)
+    return K
+
+def get_hw_from_common_conf(common_conf) -> tuple[int, int]:
+    """
+    从 common_conf 读取 (H, W)：
+    1) ocam.calib_height/calib_width 或 ocam.height/ocam.width
+    2) common_conf.image_height/image_width
+    3) common_conf.img_size （方形兜底）
+    """
+    ocam = getattr(common_conf, "ocam", None)
+    if ocam is not None:
+        H = getattr(ocam, "calib_height", getattr(ocam, "height", None))
+        W = getattr(ocam, "calib_width",  getattr(ocam, "width",  None))
+        if H is not None and W is not None:
+            return int(H), int(W)
+
+    H = getattr(common_conf, "image_height", None)
+    W = getattr(common_conf, "image_width",  None)
+    if H is not None and W is not None:
+        return int(H), int(W)
+
+    if hasattr(common_conf, "img_size"):
+        s = int(common_conf.img_size)
+        return s, s
+
+    raise RuntimeError(
+        "Cannot determine (H, W) from common_config. "
+        "Please provide ocam.{calib_height,calib_width} (or height/width), "
+        "or image_height/image_width, or img_size."
+    )
