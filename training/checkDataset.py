@@ -5,12 +5,12 @@ import pprint
 from omegaconf import OmegaConf
 
 # —— 你的工程内的导入（按实际包路径调整）
-from training.data.datasets.c3vd import C3VDDatasetv1
+from data.datasets.c3vd import C3VDDatasetv1
 # 如果 BaseDataset 的工具函数在 data.dataset_util 内部使用，这里不需要重复导入
 
 def main():
     parser = argparse.ArgumentParser("C3VD quick check")
-    parser.add_argument("--cfg", type=str, default="./config/custom.yaml", help="path to default.yaml")
+    parser.add_argument("--cfg", type=str, default="./config/custom_dataset.yaml", help="path to default.yaml")
     parser.add_argument("--root", type=str, default="/home/re_lyz/python/vggt_data/C3VD/registered", help="path to C3VD root")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val"])
     parser.add_argument("--n", type=int, default=3, help="images per sequence to fetch")
@@ -19,6 +19,7 @@ def main():
 
     # 1) 读配置
     cfg = OmegaConf.load(args.cfg)
+    
     # 取 train/val 的 common_config（两边你都已经写了 ocam 与开关）
     common_conf = cfg.data.train.common_config if args.split == "train" else cfg.data.val.common_config
 

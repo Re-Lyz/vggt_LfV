@@ -787,7 +787,7 @@ def parse_pose_row_major_4x4(line: str, assume: str = "w2c") -> np.ndarray:
     return extri_w2c_3x4
 
 
-def ocam_to_pinhole_K_from_cfg(cfg: dict | "omegaconf.dictconfig.DictConfig",
+def ocam_to_pinhole_K_from_cfg(cfg: dict | omegaconf.dictconfig.DictConfig,
                                 img_hw: tuple[int, int],
                                 *,
                                 zero_skew: bool = True) -> np.ndarray:

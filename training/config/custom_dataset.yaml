@@ -29,6 +29,7 @@ data:
       max_img_per_gpu: 48
       allow_duplicate_img: True
       repeat_batch: False
+      
 
       ocam:
         calib_width: 1350

@@ -30,6 +30,9 @@ data:
       dataset_configs:
         - _target_: data.datasets.c3vd.C3VDDatasetv1
           split: train
+          ROOT: /YOUR/PATH/TO/C3VD
+          USE_REGISTERED: True
+          
 
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
