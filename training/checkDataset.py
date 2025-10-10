@@ -3,10 +3,30 @@ import argparse
 import numpy as np
 import pprint
 from omegaconf import OmegaConf
+import torch
+import open3d as o3d  
 
 # —— 你的工程内的导入（按实际包路径调整）
 from data.datasets.c3vd import C3VDDatasetv1
 # 如果 BaseDataset 的工具函数在 data.dataset_util 内部使用，这里不需要重复导入
+
+def save_ply(points, colors, filename):
+              
+    if torch.is_tensor(points):
+        points_visual = points.reshape(-1, 3).cpu().numpy()
+    else:
+        points_visual = points.reshape(-1, 3)
+    if torch.is_tensor(colors):
+        points_visual_rgb = colors.reshape(-1, 3).cpu().numpy()
+    else:
+        points_visual_rgb = colors.reshape(-1, 3)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_visual.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(points_visual_rgb.astype(np.float64))
+    o3d.io.write_point_cloud(filename, pcd, write_ascii=True)
+
+# Usage example
+
 
 def main():
     parser = argparse.ArgumentParser("C3VD quick check")
@@ -48,6 +68,12 @@ def main():
         img_per_seq=args.n,
         aspect_ratio=1.0,
     )
+    print(batch)
+    # save_ply(
+    #     batch["world_points"][0].reshape(-1, 3), 
+    #     torch.from_numpy(batch["images"][0]).permute(0, 2, 3, 1).reshape(-1, 3), 
+    #     "debug.ply"
+    # )
 
     # 4) 打印关键信息
     print("\n=== Batch summary ===")
