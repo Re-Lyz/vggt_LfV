@@ -1,0 +1,74 @@
+mode: inference
+output_dir: outputs/vggt_eval
+device: auto
+amp:
+  enabled: true
+  dtype_policy: auto
+model:
+  pretrained_id: facebook/VGGT-1B
+  resume: ''
+  strict: false
+dataset:
+  name: c3vd_v1
+  root: /home/re_lyz/python/vggt_data/C3VD/registered
+  config_file: custom_dataset.yaml
+  use_registered: true
+  min_num_images: 2
+  assume_pose: w2c
+  depth_unit_scale: 0.001
+  limit_seqs: -1
+evaluation:
+  depth:
+    enabled: true
+    align: median
+    min_depth: 0.001
+    max_depth: 80.0
+visualization:
+  camera_path:
+    enabled: true
+    save_3d_plot: true
+  video_overlay:
+    enabled: true
+    fps: 10
+    draw_traj: true
+    draw_cam_axis: true
+    axis_len: 40
+train:
+  epochs: 5
+  log_interval: 10
+  eval_interval: 1
+  ckpt_interval: 1
+optim:
+  type: adamw
+  lr: 0.0002
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.999
+sched:
+  type: cosine
+  warmup_steps: 8000
+  step_size: 1
+  gamma: 0.1
+train_dataloader:
+  batch_size: 1
+  num_workers: 8
+  shuffle: true
+  frames_per_sample: 8
+  random_stride:
+  - 1
+  - 3
+  augment:
+    color_jitter: true
+    blur: true
+    gray: true
+    aspect_ratio_range:
+    - 0.33
+    - 1.0
+    resize_max: 518
+eval_dataloader:
+  batch_size: 1
+  num_workers: 4
+  shuffle: false
+_config_path: /home/re_lyz/python/vggt_LfV/infer&fine_tune/config/default.yaml
+_cfg_dir: /home/re_lyz/python/vggt_LfV/infer&fine_tune/config
