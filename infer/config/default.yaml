@@ -27,11 +27,20 @@ dataset:
 
 # ======= evaluation =====
 evaluation:
+  camera:
+    enabled: false
+    gt_pose_format: w2c          # 或 c2w
+    align: sim3                  # 支持: none | se3 | sim3 | scale
+    # 也支持多种一起评: ["none", "se3", "sim3"]
+    plot_3d: true
+    rpe_delta: 1
+    rpe_delta_unit: frames       # frames | seconds
   depth:
     enabled: true
-    align: median        # none | median
+    align: median
     min_depth: 0.001
     max_depth: 80.0
+
 
 # ======= visualization ==
 visualization:

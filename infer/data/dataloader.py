@@ -68,8 +68,3 @@ def get_dataset_loader(cfg: dict):
     # 用 Adapter 包一层，返回给 infer
     return C3VDDatasetV1Adapter(base=base, ds_cfg=ds)
 
-def get_train_dataloader(cfg: dict):
-    raise NotImplementedError("get_train_dataloader is not implemented yet.")
-
-def get_eval_dataloader(cfg: dict):
-    raise NotImplementedError("get_eval_dataloader is not implemented yet.")

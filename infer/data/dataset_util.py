@@ -630,11 +630,15 @@ def read_image_cv2(path: str, rgb: bool = True) -> np.ndarray:
             A numpy array of shape (H, W, 3) if successful,
             or None if the file does not exist or could not be read.
     """
+    # import sys
+    
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         print(f"File does not exist or is empty: {path}")
         return None
 
-    img = cv2.imread(path)
+    img = cv2.imread(path,cv2.IMREAD_UNCHANGED)
+    # np.set_printoptions(threshold=sys.maxsize, linewidth=10**9)
+    # print(img)
     if img is None:
         print(f"Could not load image={path}. Retrying...")
         img = cv2.imread(path)
@@ -714,47 +718,68 @@ def load_16big_png_depth(depth_png: str) -> np.ndarray:
 
 
 
-def read_depth_any(path: str, scale_adjustment: float = 1.0) -> np.ndarray:
+def read_depth_any(
+    path: str,
+    scale_adjustment: float = 1.0,
+    png_encoding: str = "half",   # "half" 与你的 load_16big_png_depth 一致；也可用 "uint16"
+    nonpositive_to_zero: bool = False,
+) -> np.ndarray:
     """
-    兼容读取 .tiff/.tif/.exr/.png 的深度，统一转 float32，并乘以 scale_adjustment。
-    .exr/.png 可直接沿用你已有 read_depth 实现；此处把 .tiff/.tif 单独处理。
+    读取 .tiff/.tif/.exr/.png 深度为 float32。
+    - PNG 默认按 half-float（16bit）解码，与 load_16big_png_depth 一致；
+      如果你的 PNG 实际是 uint16 物理量（如 mm），可传 png_encoding="uint16" 并配合 scale_adjustment=1/1000。
+    - 非有限值统一置 0；可选把 ≤0 也置 0。
     """
     p = path.lower()
-    if p.endswith(".tiff") or p.endswith(".tif"):
+
+    if p.endswith((".tif", ".tiff")):
         d = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if d is None:
-            raise ValueError(f"Failed to read depth tiff: {path}")
+            raise ValueError(f"Failed to read TIFF: {path}")
         if d.ndim == 3:
             d = d[..., 0]
         d = d.astype(np.float32)
-        d[~np.isfinite(d)] = 0.0
-        d *= scale_adjustment
-        return d
+
     elif p.endswith(".exr"):
         d = cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
         if d is None:
-            raise ValueError(f"Failed to read EXR depth: {path}")
+            raise ValueError(f"Failed to read EXR: {path}")
         if d.ndim == 3:
             d = d[..., 0]
         d = d.astype(np.float32)
+        # 粗暴截断极大坏值
         d[d > 1e9] = 0.0
-        d[~np.isfinite(d)] = 0.0
-        d *= scale_adjustment
-        return d
+
     elif p.endswith(".png"):
-        # 16-bit PNG half-float 的读取：沿用你已有实现（这里重写一版最小可用）
-        from PIL import Image
-        with Image.open(path) as depth_pil:
-            arr_u16 = np.array(depth_pil, dtype=np.uint16)
-        # 以 float16 解释，然后转 float32
-        d = np.frombuffer(arr_u16.tobytes(), dtype=np.float16).astype(np.float32)
-        d = d.reshape(arr_u16.shape)
-        d[~np.isfinite(d)] = 0.0
-        d *= scale_adjustment
-        return d
+        if png_encoding == "half":
+            # —— 与 load_16big_png_depth 一致的 half-float 解码 ——
+            with Image.open(path) as depth_pil:
+                arr_u16 = np.array(depth_pil, dtype=np.uint16)    # H×W, uint16
+            # 直接以 float16 视图重解释（等价于 frombuffer + reshape，但更直观）
+            d = arr_u16.view(np.float16).astype(np.float32)       # H×W, float32
+            # PIL 的 I;16 默认 little-endian，view 成 float16 在常见数据下匹配。
+            # 如遇到端序异常，可在这里做 byteswap: d = arr_u16.byteswap().view(np.float16).astype(np.float32)
+        elif png_encoding == "uint16":
+            # —— 若 PNG 实际是物理量的 uint16（如 mm） ——
+            with Image.open(path) as depth_pil:
+                arr_u16 = np.array(depth_pil, dtype=np.uint16)
+            d = arr_u16.astype(np.float32)
+        else:
+            raise ValueError(f"Unknown png_encoding: {png_encoding}")
+
     else:
         raise ValueError(f"Unsupported depth extension: {path}")
 
+    # 统一清理与缩放
+    d = d.astype(np.float32, copy=False)
+    d[~np.isfinite(d)] = 0.0
+    if nonpositive_to_zero:
+        d[d <= 0] = 0.0
+
+    if scale_adjustment != 1.0:
+        d *= scale_adjustment
+
+    return d
 
 def parse_pose_row_major_4x4(line: str, assume: str = "w2c") -> np.ndarray:
     """
@@ -810,14 +835,14 @@ def ocam_to_pinhole_K_from_cfg(cfg: dict | omegaconf.dictconfig.DictConfig,
     返回:
         K: (3,3) np.ndarray，近轴等效针孔内参
     """
-    oc = cfg.get("ocam", cfg)  # 允许直接传 ocam 子dict
+    oc = cfg.ocam  # 允许直接传 ocam 子dict
 
-    a0 = float(oc["a0"])
-    e  = float(oc["e"])
-    f  = float(oc["f"])
-    g  = float(oc["g"])
-    cx = float(oc["cx"])
-    cy = float(oc["cy"])
+    a0 = float(oc.a0)
+    e  = float(oc.e)
+    f  = float(oc.f)
+    g  = float(oc.g)
+    cx = float(oc.cx)
+    cy = float(oc.cy)
 
     # 仿射矩阵
     M = np.array([[e, f],
@@ -841,8 +866,8 @@ def ocam_to_pinhole_K_from_cfg(cfg: dict | omegaconf.dictconfig.DictConfig,
     # 选取“原始 K 对应的分辨率”用于缩放
     # 优先 calib_*，否则 width/height，否则用当前图像尺寸（不缩放）
     H_img, W_img = img_hw
-    W0 = oc.get("calib_width",  oc.get("width",  W_img))
-    H0 = oc.get("calib_height", oc.get("height", H_img))
+    W0 = oc.calib_width
+    H0 = oc.calib_height
     W0 = float(W0); H0 = float(H0)
 
     # 按分辨率缩放到当前图像尺寸

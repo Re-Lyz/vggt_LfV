@@ -111,6 +111,7 @@ class C3VDDatasetv1(BaseDataset):
         self.sequence_list = []
 
         seq_dirs = sorted([d for d in glob(osp.join(self.ROOT, "*")) if osp.isdir(d)])
+        # print("seq_dirs:", seq_dirs)
         for seq_dir in seq_dirs:
             seq_name = osp.basename(seq_dir)
             pose_txt = osp.join(seq_dir, "pose.txt")
@@ -131,6 +132,8 @@ class C3VDDatasetv1(BaseDataset):
 
             # 列出颜色帧
             color_files = sorted(glob(osp.join(data_dir, "*_color.png")))
+            if self.debug:
+                print(f"[Info] Found {len(color_files)} color images in {data_dir}")
             if len(color_files) == 0:
                 if self.debug:
                     print(f"[Warn] No *_color.png in {data_dir}")
@@ -156,7 +159,10 @@ class C3VDDatasetv1(BaseDataset):
                     continue
                 
                 extri_w2c = parse_pose_row_major_4x4(pose_lines[pose_idx], assume=self.assume_pose)
-
+                if self.debug:
+                    print(f"  frame {idx:04d}: pose line {pose_idx}, extri_w2c=\n{extri_w2c}")
+                    print()
+                
                 idx4 = f"{idx:04d}"
                 depth_path   = osp.join(data_dir, f"{idx4}_depth.tiff")
                 normals_path = osp.join(data_dir, f"{idx4}_normals.tiff")
@@ -173,6 +179,8 @@ class C3VDDatasetv1(BaseDataset):
                     H=self.H, W=self.W,
                     cam_name=None,  # 无多相机
                 ))
+                if self.debug:
+                    print(f"  Added frame {idx:04d}: color={cf}, depth={depth_path}, occ={occ_path}")
 
             if len(seq_items) >= min_num_images:
                 seq_items.sort(key=lambda x: x["frame_idx"])
@@ -180,13 +188,17 @@ class C3VDDatasetv1(BaseDataset):
                 self.sequence_list.append(seq_name)
 
         self.sequence_list_len = len(self.sequence_list)
+        if self.debug:
+            print(f"[C3VDDatasetv1] {split}: {self.sequence_list_len} sequences loaded from {self.ROOT}")
+            for sn in self.sequence_list:
+                print(f"  seq '{sn}': {len(self.data_store[sn])} images")
 
     # ————————————————————————————————————————————————————————————————————————
 
     def get_data(
         self,
         seq_index: int = None,
-        img_per_seq: int = 2,
+        img_per_seq: int = 4,
         seq_name: str = None,
         ids: list | None = None,
         aspect_ratio: float = 1.0,
@@ -202,9 +214,14 @@ class C3VDDatasetv1(BaseDataset):
             seq_name = self.sequence_list[seq_index]
 
         meta = self.data_store[seq_name]
+        if self.debug:
+            print("meta:", len(meta))
+            
         if ids is None:
             ids = np.random.choice(len(meta), img_per_seq, replace=self.allow_duplicate_img)
-
+        if self.debug:
+            print("ids:", ids)
+            
         target_image_shape = self.get_target_shape(aspect_ratio)
 
         images, depths = [], []
@@ -215,9 +232,14 @@ class C3VDDatasetv1(BaseDataset):
         for i in ids:
             anno = meta[int(i)]
             color_path = anno["color_path"]
+            # if self.debug:
+            #     print(f"Processing frame {i}: {color_path}")
 
             # 1) 读图（图像本身仍按实际尺寸加载；K 已按 common_conf 的 H,W 生成）
             image = read_image_cv2(color_path)
+            # if self.debug:
+                # print(f"  Read image: {color_path}, shape: {None if image is None else image.shape}")
+
             if image is None:
                 continue
 

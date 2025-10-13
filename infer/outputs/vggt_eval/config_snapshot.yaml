@@ -18,6 +18,13 @@ dataset:
   depth_unit_scale: 0.001
   limit_seqs: -1
 evaluation:
+  camera:
+    enabled: false
+    gt_pose_format: w2c
+    align: sim3
+    plot_3d: true
+    rpe_delta: 1
+    rpe_delta_unit: frames
   depth:
     enabled: true
     align: median
@@ -70,5 +77,5 @@ eval_dataloader:
   batch_size: 1
   num_workers: 4
   shuffle: false
-_config_path: /home/re_lyz/python/vggt_LfV/infer&fine_tune/config/default.yaml
-_cfg_dir: /home/re_lyz/python/vggt_LfV/infer&fine_tune/config
+_config_path: /home/re_lyz/python/vggt_LfV/infer/config/default.yaml
+_cfg_dir: /home/re_lyz/python/vggt_LfV/infer/config

@@ -84,7 +84,7 @@ data:
       get_nearby: True
       load_depth: True
       img_nums: [2, 12]
-      allow_duplicate_img: True
+      allow_duplicate_img: False
 
       ocam:
         calib_width: 1350

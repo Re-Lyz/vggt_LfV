@@ -1,0 +1,39 @@
+{
+  "sequence_mean": {
+    "abs_rel": NaN,
+    "rmse": NaN,
+    "d1": NaN,
+    "d2": NaN,
+    "d3": NaN
+  },
+  "per_frame": [
+    {
+      "abs_rel": NaN,
+      "rmse": NaN,
+      "d1": NaN,
+      "d2": NaN,
+      "d3": NaN
+    },
+    {
+      "abs_rel": NaN,
+      "rmse": NaN,
+      "d1": NaN,
+      "d2": NaN,
+      "d3": NaN
+    },
+    {
+      "abs_rel": NaN,
+      "rmse": NaN,
+      "d1": NaN,
+      "d2": NaN,
+      "d3": NaN
+    },
+    {
+      "abs_rel": NaN,
+      "rmse": NaN,
+      "d1": NaN,
+      "d2": NaN,
+      "d3": NaN
+    }
+  ]
+}

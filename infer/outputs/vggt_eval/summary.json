@@ -1,0 +1,12 @@
+{
+  "summary": {
+    "depth_overall_mean": {
+      "abs_rel": NaN,
+      "rmse": NaN,
+      "d1": NaN,
+      "d2": NaN,
+      "d3": NaN
+    }
+  },
+  "num_sequences": 2
+}

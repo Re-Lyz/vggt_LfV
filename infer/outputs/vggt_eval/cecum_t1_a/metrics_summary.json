@@ -1,0 +1,11 @@
+{
+  "sequence": "cecum_t1_a",
+  "pose": {},
+  "depth": {
+    "abs_rel": NaN,
+    "rmse": NaN,
+    "d1": NaN,
+    "d2": NaN,
+    "d3": NaN
+  }
+}
