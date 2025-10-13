@@ -21,10 +21,65 @@ def _save_csv(rows: List[Dict[str, Any]], path: Path):
         w = csv.DictWriter(f, fieldnames=keys); w.writeheader(); w.writerows(rows)
 
 
+def debug_depth_pair(pred, gt, mask=None, min_depth=1e-3, max_depth=80.0):
+    print("=== SHAPES/DTYPE ===")
+    print("pred", pred.shape, pred.dtype, "gt", gt.shape, gt.dtype, 
+          "mask", None if mask is None else (mask.shape, mask.dtype))
+
+    # 1) 基本统计
+    def stats(name, a):
+        fin = np.isfinite(a)
+        print(f"{name}: finite={fin.sum()}/{a.size}, "
+              f"min={np.nanmin(a):.6g}, max={np.nanmax(a):.6g}, "
+              f">min={(a>min_depth).sum()}, <max={(a<max_depth).sum()}")
+    stats("gt  ", gt)
+    stats("pred", pred)
+    if mask is not None:
+        print("mask: unique vals ->", np.unique(mask)[:10], 
+              " (>0 count =", (mask>0).sum(), ", ==0 count =", (mask==0).sum(), ")")
+
+    # 2) resize 一下 pred 到 gt 尺寸（和你评估一致）
+    if pred.shape != gt.shape:
+        from cv2 import resize, INTER_LINEAR
+        ph, pw = gt.shape[:2]
+        pred = resize(pred, (pw, ph), interpolation=INTER_LINEAR)
+
+    # 3) 逐步构造 valid
+    vg = np.isfinite(gt) & (gt > min_depth) & (gt < max_depth)
+    vp = np.isfinite(pred) & (pred > min_depth)
+    vm = (mask > 0) if mask is not None else np.ones_like(vg, dtype=bool)
+
+    print("\n=== VALID COUNTS ===")
+    print("valid(gt)   =", vg.sum())
+    print("valid(pred) =", vp.sum())
+    print("mask>0      =", vm.sum(), "(注意：这里期望 mask>0 表示【有效像素】)")
+    valid = vg & vp & vm
+    print("valid ALL   =", valid.sum())
+
+    # 4) 若 ALL=0，快速判别是哪一项清空了
+    if valid.sum() == 0:
+        print("\nZERO valid! Quick test:")
+        print("  vg&vp      =", (vg & vp).sum())
+        print("  vg&vm      =", (vg & vm).sum())
+        print("  vp&vm      =", (vp & vm).sum())
+        print("  是否是 mask 极性反了? 试试用 (mask==0) 当有效：", (vg & vp & (mask==0)).sum() if mask is not None else "N/A")
+        return
+
+    # 5) 对齐后再看一眼
+    pv = pred[valid].astype(np.float64)
+    gv = gt[valid].astype(np.float64)
+    s = np.median(gv) / (np.median(pv) + 1e-8)
+    pv *= s
+    print("\n=== AFTER ALIGN (median) ===")
+    print("pv min/max:", pv.min(), pv.max(), "gv min/max:", gv.min(), gv.max())
+    ratio = np.maximum(pv/(gv+1e-8), gv/(pv+1e-8))
+    print("δ1, δ2, δ3:", (ratio<1.25).mean(), (ratio<1.25**2).mean(), (ratio<1.25**3).mean())
+
+
 # ---------- utils ----------
 def _read_depth(
     path: str,
-    scale_adjustment: float = 1.0,
+    scale_adjustment: float = 1/1000.0,
     png_encoding: str = "half",     # "half": 16bit 按 float16 解释；"uint16": 当作物理量的 uint16
     nonpositive_to_zero: bool = False,
 ) -> np.ndarray:
@@ -77,6 +132,10 @@ def _read_depth(
 
     if scale_adjustment != 1.0:
         d *= scale_adjustment
+
+    # import sys
+    # np.set_printoptions(threshold=sys.maxsize, linewidth=10**9) 
+    # print(d)
 
     return d
 
@@ -142,36 +201,83 @@ def _depths_from_outputs(outputs: Dict[str, Any]) -> Optional[List[np.ndarray]]:
 
 # ---------- metrics ----------
 def _depth_metrics_single(
-    pred: np.ndarray, gt: np.ndarray, mask: Optional[np.ndarray],
-    align: str = "median", min_depth: float = 1e-3, max_depth: float = 80.0
+    pred: np.ndarray,
+    gt:   np.ndarray,
+    mask: Optional[np.ndarray],
+    align: str = "median",          # "median" | "mean" | "lsq" | "none"
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
+    clamp_after_align: bool = True, # 对齐后将深度裁到[min_depth,max_depth]
+    debug: bool = False,
 ) -> Dict[str, float]:
+    """
+    计算常见深度评估指标（AbsRel / RMSE / δ1, δ2, δ3）。
+    - 会将 pred resize 到 gt 的尺寸；
+    - 有效像素条件：gt 有效 & pred 有效 & (可选)外部mask；
+    - 对齐支持 median/mean/lsq/none；
+    - 返回 dict，若无有效像素则各项为 NaN。
+    """
+    assert gt.ndim == 2, "gt must be HxW"
     H, W = gt.shape
-    pred = _resize_to(pred, H, W, linear=True)
 
+    # 1) resize + 转 float64 以减少数值误差
+    pred = _resize_to(pred, H, W, linear=True).astype(np.float64, copy=False)
+    gt   = gt.astype(np.float64, copy=False)
+
+    eps = 1e-8
+
+    # 2) 有效像素筛选：同时约束 gt 和 pred
     valid = np.isfinite(gt) & (gt > min_depth) & (gt < max_depth)
+    valid &= np.isfinite(pred) & (pred > min_depth)
     if mask is not None:
+        # 约定：mask>0 表示有效像素（若你的mask语义相反请在上游转换）
         valid &= (mask > 0)
+
+    if debug:
+        print("gt finite =", np.isfinite(gt).sum(), "/", gt.size)
+        if np.isfinite(gt).any():
+            print("gt min/max:", np.nanmin(gt), np.nanmax(gt))
+            print("gt > 0 count:", (gt > 0).sum())
+            print("gt > 1e-3 count:", (gt > 1e-3).sum())
+            print("gt < 80 count:", (gt < 80).sum())
 
     if valid.sum() == 0:
         return {"abs_rel": np.nan, "rmse": np.nan, "d1": np.nan, "d2": np.nan, "d3": np.nan}
 
-    pv = pred[valid].astype(np.float64)
-    gv = gt[valid].astype(np.float64)
+    pv = pred[valid]
+    gv = gt[valid]
 
+    # 3) 对齐（尺度） —— 可选最小二乘更稳
     if align == "median":
-        s = np.median(gv) / (np.median(pv) + 1e-12)
-        pv *= s
+        s = np.median(gv) / (np.median(pv) + eps)
+        pv = pv * s
     elif align == "mean":
-        s = np.mean(gv) / (np.mean(pv) + 1e-12)
-        pv *= s
-    # align == "none": 不缩放
+        s = np.mean(gv) / (np.mean(pv) + eps)
+        pv = pv * s
+    elif align == "lsq":
+        # 最小二乘比例：argmin_s || s*pv - gv ||^2 -> s = (pv·gv)/(pv·pv)
+        denom = float(np.dot(pv, pv)) + eps
+        s = float(np.dot(pv, gv)) / denom
+        pv = pv * s
+    elif align == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown align mode: {align}")
 
-    abs_rel = float(np.mean(np.abs(pv - gv) / (gv + 1e-12)))
-    rmse = float(np.sqrt(np.mean((pv - gv) ** 2)))
-    ratio = np.maximum(pv / (gv + 1e-12), gv / (pv + 1e-12))
+    # 4) 可选：对齐后裁剪范围，避免极端值影响 RMSE/AbsRel
+    if clamp_after_align:
+        pv = np.clip(pv, min_depth, max_depth)
+        gv = np.clip(gv, min_depth, max_depth)
+
+    # 5) 指标
+    abs_rel = float(np.mean(np.abs(pv - gv) / (gv + eps)))
+    rmse    = float(np.sqrt(np.mean((pv - gv) ** 2)))
+
+    ratio = np.maximum(pv / (gv + eps), gv / (pv + eps))
     d1 = float(np.mean(ratio < 1.25))
-    d2 = float(np.mean(ratio < 1.25 ** 2))
-    d3 = float(np.mean(ratio < 1.25 ** 3))
+    d2 = float(np.mean(ratio < (1.25 ** 2)))
+    d3 = float(np.mean(ratio < (1.25 ** 3)))
+
     return {"abs_rel": abs_rel, "rmse": rmse, "d1": d1, "d2": d2, "d3": d3}
 
 
@@ -208,7 +314,7 @@ def evaluate_sequence_depth(
         mk = _read_mask(masks[i]) if masks and i < len(masks) else None
         # print("gd:", gd)
         # print("pd:", mk)
-        
+        # debug_depth_pair(pd, gd, mk, min_depth=min_d, max_depth=max_d)
         m = _depth_metrics_single(pd, gd, mk, align=align, min_depth=min_d, max_depth=max_d)
         per_frame.append(m); rows.append({"frame": i, **m})
 

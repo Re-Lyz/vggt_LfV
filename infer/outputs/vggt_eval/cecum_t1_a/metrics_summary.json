@@ -1,11 +1,39 @@
 {
   "sequence": "cecum_t1_a",
-  "pose": {},
+  "pose": {
+    "sim3": {
+      "APE": {
+        "trans_rmse": 128.84620643670766,
+        "trans_mean": 128.8458247126261,
+        "trans_median": 128.84701803171805,
+        "trans_std": 0.3136355431268897,
+        "rot_rmse_deg": 156.90164615764238,
+        "rot_mean_deg": 155.68290154295912,
+        "rot_median_deg": 163.85401976018903,
+        "rot_std_deg": 19.518215444638166,
+        "num_poses": 4,
+        "mode": "sim3"
+      },
+      "RPE": {
+        "delta": 1,
+        "delta_unit": "frames",
+        "trans_rmse": 0.3383303661002105,
+        "trans_mean": 0.3367058924187943,
+        "trans_median": 0.346103200765028,
+        "trans_std": 0.03311462873060463,
+        "rot_rmse_deg": 122.66794052065777,
+        "rot_mean_deg": 107.2112798922289,
+        "rot_median_deg": 124.82537862397784,
+        "rot_std_deg": 59.608431412425084,
+        "mode": "sim3"
+      }
+    }
+  },
   "depth": {
-    "abs_rel": NaN,
-    "rmse": NaN,
-    "d1": NaN,
-    "d2": NaN,
-    "d3": NaN
+    "abs_rel": 0.6797887928870388,
+    "rmse": 19.1502032789762,
+    "d1": 0.25447100750648693,
+    "d2": 0.42392602534579316,
+    "d3": 0.5545428807706447
   }
 }

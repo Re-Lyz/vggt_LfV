@@ -28,7 +28,7 @@ dataset:
 # ======= evaluation =====
 evaluation:
   camera:
-    enabled: false
+    enabled: true
     gt_pose_format: w2c          # 或 c2w
     align: sim3                  # 支持: none | se3 | sim3 | scale
     # 也支持多种一起评: ["none", "se3", "sim3"]

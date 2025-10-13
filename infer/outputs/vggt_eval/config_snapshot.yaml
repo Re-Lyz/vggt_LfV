@@ -19,7 +19,7 @@ dataset:
   limit_seqs: -1
 evaluation:
   camera:
-    enabled: false
+    enabled: true
     gt_pose_format: w2c
     align: sim3
     plot_3d: true
