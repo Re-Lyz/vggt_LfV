@@ -1,3 +1,4 @@
+.gradio/
 .hydra/
 output/
 ckpt/
