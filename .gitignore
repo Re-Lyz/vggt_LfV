@@ -1,3 +1,5 @@
+infer/outputs
+
 .gradio/
 .hydra/
 output/
