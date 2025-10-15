@@ -19,10 +19,12 @@ from tqdm import tqdm
 import torch
 from collections import defaultdict
 import torch.nn as nn
+import os
+import torch
+import torch.distributed as dist
+import contextlib
+from datetime import timedelta
 
-# -----------------------
-# 占位函数导入（尚未实现）
-# -----------------------
 # utils：配置 / IO / 随机种子 / 基础IO工具
 from utils import (
     load_config,           # (cfg_path:str|Path) -> dict
@@ -70,32 +72,60 @@ class _DPInferAdapter(nn.Module):
         return self.wrapper.infer_images(images, query_points=query_points)
 
 
+
+def dist_is_ready() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+def get_rank() -> int:
+    return dist.get_rank() if dist_is_ready() else 0
+
+def get_world_size() -> int:
+    return dist.get_world_size() if dist_is_ready() else 1
+
+def setup_ddp(backend: str = "nccl", timeout_minutes: int = 60):
+    """
+    依赖 torchrun 注入的环境变量：RANK / WORLD_SIZE / LOCAL_RANK
+    """
+    if not dist.is_available() or dist_is_ready():
+        return
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    
+    dist.init_process_group(
+        backend=backend,
+        init_method="env://",
+        timeout=timedelta(minutes=timeout_minutes),  # ← 用 datetime.timedelta
+        rank=rank,
+        world_size=world_size,
+    )
+
+
+def cleanup_ddp():
+    if dist_is_ready():
+        dist.destroy_process_group()
+
+
 # -----------------------
 # 公共：一次前向（推理）
 # -----------------------
-# === 修改：单步前向，兼容 DataParallel ===
 def _forward_infer(
-    model,
+    model: nn.Module,
     images: torch.Tensor,
-    device: str,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     query_points: Optional[torch.Tensor] = None,
 ):
     with torch.no_grad():
-        if device.startswith("cuda") and amp_enabled:
-            with torch.cuda.amp.autocast(dtype=amp_dtype):
-                # DataParallel: 直接调用 model(images, query_points)
-                if isinstance(model, nn.DataParallel):
-                    preds = model(images, query_points)
-                else:
-                    preds = model.infer_images(images, query_points=query_points)
-        else:
-            if isinstance(model, nn.DataParallel):
-                preds = model(images, query_points)
-            else:
-                preds = model.infer_images(images, query_points=query_points)
-    return preds
+        use_amp = (images.is_cuda and amp_enabled)
+        ctx = torch.cuda.amp.autocast(dtype=amp_dtype) if use_amp else contextlib.nullcontext()
+        with ctx:
+            # 这里 model 是 DDP 包裹的 _DPInferAdapter，直接调用即可
+            return model(images, query_points)
+
 
 
 # -----------------------
@@ -106,146 +136,179 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
     ensure_dir(out_root)
     dump_config(cfg, out_root)
 
-    # 读取是否启用多卡
-    dp_cfg = cfg.get("inference", {}).get("data_parallel", True)  # 默认开
-    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    # ===== 配置并初始化 DDP =====
+    ddp_conf = cfg.get("inference", {})
+    use_ddp = bool(ddp_conf.get("ddp", False))
+    only_rank0_visual = bool(ddp_conf.get("only_rank0_visual", True))
+    use_rank_subdir = bool(ddp_conf.get("rank_output_subdir", True))
+    infer_cap = int(ddp_conf.get("max_img_per_gpu", -1))
 
-    # 模型：先构建单卡 wrapper
-    # 注意：为了 DP 正确 scatter/gather，主设备固定到 cuda:0
-    main_device = "cuda:0" if (device.startswith("cuda") and n_gpu > 0) else device
-    model = VGGTWrapper(device=main_device, amp_dtype=amp_dtype, amp_enabled=amp_enabled)
-
-    # 如果具备多卡且允许 DP，则包一层适配器 + DataParallel
-    if dp_cfg and n_gpu > 1 and main_device.startswith("cuda"):
-        model = nn.DataParallel(_DPInferAdapter(model), device_ids=list(range(n_gpu)))
-        # 之后所有张量一律先放到 cuda:0，再交给 DP 切分
-        device = main_device
-
-    # 数据集（要求 loader 自带 load_and_preprocess_images）
-    loader = get_dataset_loader(cfg)
-
-    # print(loader.base.get_data())
-
-    # 调试模式（需判空 args）
-    if args and getattr(args, "debug_loader", False):
-        out_dir = Path(cfg.get("output_dir", "outputs")) / "debug_loader"
-        ensure_dir(out_dir)
-        inspect_loader(
-            loader=loader,
-            device=device,
-            out_dir=out_dir,
-            max_sequences=getattr(args, "debug_max_seqs", 1),
-            max_frames_visual=getattr(args, "debug_max_frames", 12),
-            fps=int(cfg.get("visualization", {}).get("video_overlay", {}).get("fps", 8)),
+    if use_ddp and torch.cuda.is_available():
+        setup_ddp(
+            backend=ddp_conf.get("ddp_backend", "nccl"),
+            timeout_minutes=int(ddp_conf.get("ddp_timeout_mins", 60)),
         )
-        return  # 调试完直接退出
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device = f"cuda:{local_rank}"
+    else:
+        # 单卡路径（不初始化进程组）
+        device = "cuda:0" if (device == "auto" and torch.cuda.is_available()) else device
 
+    # ===== 构建模型 =====
+    # 包一层适配器以便 DDP 正常 forward（适配器内部调用 wrapper.infer_images）
+    wrapper = VGGTWrapper(device=device, amp_dtype=amp_dtype, amp_enabled=amp_enabled)
+    model = _DPInferAdapter(wrapper).to(device)
+
+    if use_ddp and torch.cuda.is_available():
+        model = torch.nn.parallel.DistributedDataParallel(
+            module=model,
+            device_ids=[int(device.split(":")[1])] if device.startswith("cuda") else None,
+            output_device=int(device.split(":")[1]) if device.startswith("cuda") else None,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+
+    # ===== 数据集 & 序列划分（DDP 每个 rank 处理不重叠子集）=====
+    loader = get_dataset_loader(cfg)
     seq_ids = loader.list_sequences()
     limit = cfg.get("dataset", {}).get("limit_seqs", -1)
     if isinstance(limit, int) and limit > 0:
         seq_ids = seq_ids[:limit]
 
+    rank = get_rank()
+    world_size = get_world_size()
+    if use_ddp and world_size > 1:
+        seq_ids = seq_ids[rank::world_size]  # 轮转切分，避免重复
+
+    # ===== 推理主循环 =====
     all_seq_depth_metrics = []
     pose_collect = defaultdict(lambda: {"APE": defaultdict(list), "RPE": defaultdict(list)})
 
-    pbar = tqdm(seq_ids, desc=f"Inference ({cfg.get('dataset', {}).get('name', '')})")
-    for seq_id in pbar:
+    iterator = tqdm(seq_ids, desc="Inference") if rank == 0 else seq_ids
+    for seq_id in iterator:
         try:
-            seq_item = loader.build_sequence(seq_id)  # 需含 images / gt / meta
-            seq_out = out_root / seq_item.meta.get("sequence_name", "seq")
-            ensure_dir(seq_out)
+            seq_item = loader.build_sequence(seq_id)
+            seq_out = out_root / seq_item.meta.get("sequence_name", f"seq_{seq_id}")
 
-            # 预处理由数据集完成
-            images = loader.load_and_preprocess_images(seq_item.images, device=device)  # 若启用DP，此处 device 为 "cuda:0"
+            # rank 输出目录策略
+            if rank == 0 or not use_rank_subdir:
+                out_dir_this_root = seq_out
+            else:
+                out_dir_this_root = seq_out / f"rank{rank}"
+            ensure_dir(out_dir_this_root)
+
+            # 读取并预处理图像到当前设备
+            images = loader.load_and_preprocess_images(seq_item.images, device=device)
+
+            # 可选：限制每次前向的帧上限（以帧计的 minibatch cap）
+            if isinstance(images, torch.Tensor) and images.dim() >= 1 and infer_cap > 0:
+                if images.shape[0] > infer_cap:
+                    images = images[:infer_cap]
+
+            # （可选）查询点
             query_points = None
             if hasattr(loader, "load_and_preprocess_query_points"):
                 try:
                     query_points = loader.load_and_preprocess_query_points(seq_item, device=device)
                 except Exception:
                     query_points = None
-            elif isinstance(getattr(seq_item, "gt", None), dict):
-                qp = seq_item.gt.get("query_points_tensor", None)
-                query_points = qp if isinstance(qp, torch.Tensor) else None
 
-            # 推理
+            # === 前向推理 ===
             preds = _forward_infer(
-                model, images,
-                device=device, amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                model=model,
+                images=images,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
                 query_points=query_points,
             )
-            print("finished infer", seq_id, {k: (v.shape if isinstance(v, torch.Tensor) else type(v)) for k, v in preds.items()})
-            # print()
-            # print("pose:", preds.get("pose", None).shape)
-            # print("depth:", preds.get("depth", None).shape)
-            # print("depth_conf:", preds.get("depth_conf", None).shape)
-            # print()
-            
-            # —— 位姿评估（按多种对齐模式）——
+
+            # === 位姿评估 ===
             cam_cfg = cfg.get("evaluation", {}).get("camera", {})
-            pose_results_by_mode = {}
             if cam_cfg.get("enabled", True):
+                cam_cfg_eff = dict(cam_cfg)
+                # 非 rank0 禁用绘图，避免并发可视化冲突
+                if only_rank0_visual and rank != 0:
+                    cam_cfg_eff["plot_3d"] = False
+
                 pose_results_by_mode = evaluate_and_visualize_poses(
                     preds=preds,
                     seq_item=seq_item,
-                    out_dir=seq_out,
-                    camera_cfg=cam_cfg,   # 里边读取 align / rpe_delta 等
+                    out_dir=out_dir_this_root,
+                    camera_cfg=cam_cfg_eff,
                 )
-                # 收集到全局 pose_collect，用于最后做 overall mean
-                for mode, res in pose_results_by_mode.items():            # mode: 'sim3'/'se3'/'none'/...
-                    for mname, mdict in res.items():                      # 'APE' 或 'RPE'
+                for mode, res in pose_results_by_mode.items():
+                    for mname, mdict in res.items():
                         for k, v in mdict.items():
-                            if isinstance(v, (int, float)):               # 只聚合数值项
+                            if isinstance(v, (int, float)):
                                 pose_collect[mode][mname][k].append(v)
 
-            # —— 深度评估 —— 
+            # === 深度评估 ===
             depth_cfg = cfg.get("evaluation", {}).get("depth", {"enabled": True})
-            depth_metrics = {}
             if depth_cfg.get("enabled", True):
+                depth_cfg_eff = dict(depth_cfg)
+                # 如需也在非 rank0 关闭可视化，可在这里调整 depth_cfg_eff 的相关开关
                 depth_metrics = evaluate_sequence_depth(
                     preds=preds,
                     gt_paths=seq_item.gt.get("depth_paths", []),
                     masks=seq_item.gt.get("valid_masks", None),
-                    depth_cfg=depth_cfg,
-                    out_dir=seq_out,
+                    depth_cfg=depth_cfg_eff,
+                    out_dir=out_dir_this_root,
                 )
                 all_seq_depth_metrics.append(depth_metrics)
-                # print("depth_metrics:", depth_metrics)
-            # 每序列的快速汇总（可选）
+            else:
+                depth_metrics = {}
+
+            # 每序列的 metrics 快速落盘
             dump_json({
                 "sequence": seq_item.meta.get("sequence_name", str(seq_id)),
-                "pose": pose_results_by_mode,
                 "depth": depth_metrics,
-            }, seq_out / "metrics_summary.json")
+            }, out_dir_this_root / "metrics_summary.json")
 
         except Exception as e:
-            # 单序列出错不中断，标记并继续
-            print(f"[WARN] sequence {seq_id} failed: {e}")
-            
-    # 可视化实现
+            print(f"[WARN][rank {rank}] sequence {seq_id} failed: {e}")
 
+    # ===== 跨 rank 汇总到 rank0 =====
+    if use_ddp and world_size > 1:
+        gather_list = [None for _ in range(world_size)] if rank == 0 else None
+        dist.gather_object(
+            obj=dict(depth=all_seq_depth_metrics, pose=pose_collect),
+            gather_list=gather_list,
+            dst=0,
+        )
 
-    # ===== 汇总 =====
-    summary = {}
+        if rank == 0:
+            merged_depth = []
+            merged_pose = defaultdict(lambda: {"APE": defaultdict(list), "RPE": defaultdict(list)})
+            for it in gather_list:
+                merged_depth.extend(it["depth"])
+                for mode, groups in it["pose"].items():
+                    for mname, stats in groups.items():
+                        for k, arr in stats.items():
+                            merged_pose[mode][mname][k].extend(arr)
+            all_seq_depth_metrics = merged_depth
+            pose_collect = merged_pose
 
-    # 深度：整体均值
-    if all_seq_depth_metrics:
-        summary["depth_overall_mean"] = aggregate_depth_metrics(all_seq_depth_metrics)
+    # ===== 只有 rank0 写最终汇总 =====
+    if rank == 0:
+        summary = {}
+        if all_seq_depth_metrics:
+            summary["depth_overall_mean"] = aggregate_depth_metrics(all_seq_depth_metrics)
 
-    # 位姿：按模式/指标聚合均值
-    pose_overall = {}
-    for mode, groups in pose_collect.items():
-        pose_overall[mode] = {}
-        for mname, stats_dict in groups.items():  # 'APE' 或 'RPE'
-            pose_overall[mode][mname] = {}
-            for k, arr in stats_dict.items():
-                if len(arr) == 0:
-                    continue
-                pose_overall[mode][mname][k] = float(sum(arr) / len(arr))
-    if pose_overall:
-        summary["camera_overall_mean"] = pose_overall
+        pose_overall = {}
+        for mode, groups in pose_collect.items():
+            pose_overall[mode] = {}
+            for mname, stats_dict in groups.items():
+                vals = {k: float(sum(v) / len(v)) for k, v in stats_dict.items() if len(v) > 0}
+                if vals:
+                    pose_overall[mname] = vals
+        if pose_overall:
+            summary["camera_overall_mean"] = pose_overall
 
-    dump_json({"summary": summary, "num_sequences": len(seq_ids)}, out_root / "summary.json")
-    print("Inference done. Summary:", json.dumps(summary, indent=2, ensure_ascii=False))
+        dump_json({"summary": summary, "num_sequences": len(loader.list_sequences())}, out_root / "summary.json")
+        print("[rank0] Inference done. Summary:", json.dumps(summary, indent=2, ensure_ascii=False))
+
+    if use_ddp and dist_is_ready():
+        cleanup_ddp()
 
 # def test(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, args=None):
 #     out_root = Path(cfg.get("output_dir", "outputs/infer"))

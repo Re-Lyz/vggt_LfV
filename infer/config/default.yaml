@@ -4,7 +4,13 @@ mode: inference          # inference | finetune | lora
 # ======= runtime ========
 output_dir: outputs/vggt_eval
 inference:
-  data_parallel: true   # 开/关 DataParallel
+  ddp: false                # ← 开启 DDP 推理（用 torchrun 启动） torchrun --nproc_per_node=4 infer.py -c path/to/your.yaml
+  ddp_backend: nccl         # 单机多卡常用 nccl
+  ddp_timeout_mins: 60
+  max_img_per_gpu: 32       # ← 可选：推理阶段也显式限制“每步送入的帧数上限”
+  only_rank0_visual: true   # ← 仅 rank0 做可视化与总汇总，避免多进程抢 IO
+  rank_output_subdir: true  # ← 其它 rank 写入 sequence_dir/rank{N}/ 以防冲突
+  gather: gather_object     # ← 跨 rank 汇总方式：gather_object | none
 device: auto             # auto/cuda/cpu
 amp:
   enabled: true
