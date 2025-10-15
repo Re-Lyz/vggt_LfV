@@ -18,6 +18,7 @@ import json
 from tqdm import tqdm
 import torch
 from collections import defaultdict
+import torch.nn as nn
 
 # -----------------------
 # 占位函数导入（尚未实现）
@@ -58,24 +59,44 @@ from eval.depth import evaluate_sequence_depth, aggregate_depth_metrics
 #     make_video_with_overlays,  # (image_paths:List[str], out_path:Path, traj_normed_xy:Optional[np.ndarray[B,2]], fps:int, draw_traj:bool, draw_cam_axis:bool, axis_len:int) -> None
 # )
 
+# === 新增：适配器，把 VGGTWrapper 暴露为 nn.Module 的 forward ===
+class _DPInferAdapter(nn.Module):
+    def __init__(self, wrapper: VGGTWrapper):
+        super().__init__()
+        self.wrapper = wrapper  # 不展开到子模块，避免 state_dict 名称变化
+
+    def forward(self, images: torch.Tensor, query_points: Optional[torch.Tensor] = None):
+        # 直接调用你现有的单卡推理入口
+        return self.wrapper.infer_images(images, query_points=query_points)
+
+
 # -----------------------
 # 公共：一次前向（推理）
 # -----------------------
+# === 修改：单步前向，兼容 DataParallel ===
 def _forward_infer(
-    model: VGGTWrapper,
+    model,
     images: torch.Tensor,
     device: str,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-    query_points: Optional[torch.Tensor] = None,    
+    query_points: Optional[torch.Tensor] = None,
 ):
     with torch.no_grad():
-        if device == "cuda" and amp_enabled:
+        if device.startswith("cuda") and amp_enabled:
             with torch.cuda.amp.autocast(dtype=amp_dtype):
-                preds = model.infer_images(images, query_points=query_points)  
+                # DataParallel: 直接调用 model(images, query_points)
+                if isinstance(model, nn.DataParallel):
+                    preds = model(images, query_points)
+                else:
+                    preds = model.infer_images(images, query_points=query_points)
         else:
-            preds = model.infer_images(images, query_points=query_points) 
+            if isinstance(model, nn.DataParallel):
+                preds = model(images, query_points)
+            else:
+                preds = model.infer_images(images, query_points=query_points)
     return preds
+
 
 # -----------------------
 # 推理主流程
@@ -85,8 +106,20 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
     ensure_dir(out_root)
     dump_config(cfg, out_root)
 
-    # 模型
-    model = VGGTWrapper(device=device, amp_dtype=amp_dtype, amp_enabled=amp_enabled)
+    # 读取是否启用多卡
+    dp_cfg = cfg.get("inference", {}).get("data_parallel", True)  # 默认开
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    # 模型：先构建单卡 wrapper
+    # 注意：为了 DP 正确 scatter/gather，主设备固定到 cuda:0
+    main_device = "cuda:0" if (device.startswith("cuda") and n_gpu > 0) else device
+    model = VGGTWrapper(device=main_device, amp_dtype=amp_dtype, amp_enabled=amp_enabled)
+
+    # 如果具备多卡且允许 DP，则包一层适配器 + DataParallel
+    if dp_cfg and n_gpu > 1 and main_device.startswith("cuda"):
+        model = nn.DataParallel(_DPInferAdapter(model), device_ids=list(range(n_gpu)))
+        # 之后所有张量一律先放到 cuda:0，再交给 DP 切分
+        device = main_device
 
     # 数据集（要求 loader 自带 load_and_preprocess_images）
     loader = get_dataset_loader(cfg)
@@ -123,9 +156,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
             ensure_dir(seq_out)
 
             # 预处理由数据集完成
-            images = loader.load_and_preprocess_images(seq_item.images, device=device)
-
-            # （预留）查询点
+            images = loader.load_and_preprocess_images(seq_item.images, device=device)  # 若启用DP，此处 device 为 "cuda:0"
             query_points = None
             if hasattr(loader, "load_and_preprocess_query_points"):
                 try:
@@ -178,7 +209,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
                     out_dir=seq_out,
                 )
                 all_seq_depth_metrics.append(depth_metrics)
-                print("depth_metrics:", depth_metrics)
+                # print("depth_metrics:", depth_metrics)
             # 每序列的快速汇总（可选）
             dump_json({
                 "sequence": seq_item.meta.get("sequence_name", str(seq_id)),

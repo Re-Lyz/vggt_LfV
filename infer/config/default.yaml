@@ -3,6 +3,8 @@ mode: inference          # inference | finetune | lora
 
 # ======= runtime ========
 output_dir: outputs/vggt_eval
+inference:
+  data_parallel: true   # 开/关 DataParallel
 device: auto             # auto/cuda/cpu
 amp:
   enabled: true
