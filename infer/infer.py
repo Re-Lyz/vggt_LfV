@@ -150,13 +150,19 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
     model = _DPInferAdapter(wrapper).to(device)
 
     if use_ddp and torch.cuda.is_available():
-        model = torch.nn.parallel.DistributedDataParallel(
-            module=model,
-            device_ids=[int(device.split(":")[1])] if device.startswith("cuda") else None,
-            output_device=int(device.split(":")[1]) if device.startswith("cuda") else None,
-            broadcast_buffers=False,
-            find_unused_parameters=False,
-        )
+        # 只有在模型里存在需要梯度的参数时才包 DDP；否则保持原样（仍可用 dist.gather/barrier）
+        need_ddp_wrap = any(p.requires_grad for p in model.parameters())
+        if need_ddp_wrap:
+            model = torch.nn.parallel.DistributedDataParallel(
+                module=model,
+                device_ids=[int(device.split(":")[1])] if device.startswith("cuda") else None,
+                output_device=int(device.split(":")[1]) if device.startswith("cuda") else None,
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+            )
+        else:
+            if get_rank() == 0:
+                print("[info] DDP wrap skipped: no parameter requires grad; using dist for coordination only.")
 
     # ===== 数据集（所有 rank 同步遍历相同序列）=====
     loader = get_dataset_loader(cfg)
