@@ -209,7 +209,7 @@ class C3VDDatasetv1(BaseDataset):
             # 3) 位姿/内参（OpenCV 约定；外参为 w->c 3x4）
             extri_opencv = np.array(anno["extri_w2c"], dtype=np.float64)
             intri_opencv = np.array(anno["K"], dtype=np.float64)
-
+            # print("shape of image before process_one_image:", image.shape)
             # 4) 统一预处理与点云
             (image, depth_map, extri_opencv, intri_opencv,
              world_coords_points, cam_coords_points, point_mask, _) = self.process_one_image(
@@ -221,7 +221,7 @@ class C3VDDatasetv1(BaseDataset):
                 target_image_shape=target_image_shape,
                 filepath=color_path
             )
-
+            print("shape of image after process_one_image:", image.shape)
             images.append(image)
             depths.append(depth_map)
             extrinsics.append(extri_opencv)
@@ -245,7 +245,7 @@ class C3VDDatasetv1(BaseDataset):
             "point_masks": point_masks,
             "original_sizes": original_sizes,
         }
-
+        # print("shape of batch['images']:", np.array(batch["images"]).shape)
         if getattr(self, "debug", False):
             batch["_debug_image_paths"] = [meta[int(i)]["color_path"] for i in ids]
             batch["_debug_depth_paths"] = [
@@ -256,5 +256,8 @@ class C3VDDatasetv1(BaseDataset):
                 meta[int(i)]["occ_path"] if osp.isfile(meta[int(i)]["occ_path"]) else None
                 for i in ids
             ]
-
+        print(f"[C3VD] got_frames={len(images)} target={img_per_seq}")
         return batch
+    
+    
+    

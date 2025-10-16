@@ -249,10 +249,10 @@ class Trainer:
         self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
         self.model = instantiate(self.model_conf, _recursive_=False)
         self._maybe_load_vggt_pretrained()
-        print("=== TOP-LEVEL CHILDREN ===")
-        summary_named_children(self.model, depth=2)
-        print("=== SAMPLE PARAM NAMES ===")
-        peek_param_names(self.model, k=40)
+        # print("=== TOP-LEVEL CHILDREN ===")
+        # summary_named_children(self.model, depth=2)
+        # print("=== SAMPLE PARAM NAMES ===")
+        # peek_param_names(self.model, k=40)
         self.loss = instantiate(self.loss_conf, _recursive_=False)
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
@@ -400,8 +400,6 @@ class Trainer:
             skip_saving_parameters=[],
             **checkpoint_content,
         )
-
-
 
 
     def _get_scalar_log_keys(self, phase: str) -> List[str]:
@@ -563,7 +561,7 @@ class Trainer:
             param_names = ",".join(config['module_names'])
             loss_meters[f"Grad/{param_names}"] = AverageMeter(f"Grad/{param_names}", self.device, ":.4f")
 
-
+        # print("train_loader:", train_loader)
         progress = ProgressMeter(
             num_batches=len(train_loader),
             meters=[
@@ -604,7 +602,7 @@ class Trainer:
                 batch = self._process_batch(batch)
 
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
-
+            print("After copy_data_to_device, batch['images'].shape:", batch['images'].shape)
             accum_steps = self.accum_steps
 
             if accum_steps==1:
@@ -791,6 +789,7 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
+        # print("shape of input images:", batch["images"].shape)
         y_hat = model(images=batch["images"])
         
         # Loss computation
