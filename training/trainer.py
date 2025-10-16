@@ -77,6 +77,7 @@ class Trainer:
         loss: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
+        pretrained: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         """
@@ -111,6 +112,7 @@ class Trainer:
         self.logging_conf = logging
         self.checkpoint_conf = checkpoint
         self.optim_conf = optim
+        self.pretrained_conf = pretrained
 
         # Store hyperparameters
         self.accum_steps = accum_steps
@@ -123,6 +125,7 @@ class Trainer:
         
         # 'where' tracks training progress from 0.0 to 1.0 for schedulers
         self.where = 0.0
+        
 
         self._setup_device(device)
         self._setup_torch_dist_and_backend(cuda, distributed)
@@ -245,10 +248,15 @@ class Trainer:
         # Instantiate components from configs
         self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
         self.model = instantiate(self.model_conf, _recursive_=False)
+        self._maybe_load_vggt_pretrained()
+        print("=== TOP-LEVEL CHILDREN ===")
+        summary_named_children(self.model, depth=2)
+        print("=== SAMPLE PARAM NAMES ===")
+        peek_param_names(self.model, k=40)
         self.loss = instantiate(self.loss_conf, _recursive_=False)
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
-
+        
         # Freeze specified model parameters if any
         if getattr(self.optim_conf, "frozen_module_names", None):
             logging.info(
@@ -302,6 +310,46 @@ class Trainer:
             device_ids=[self.local_rank] if device == "cuda" else [],
             **ddp_options,
         )
+
+    def _maybe_load_vggt_pretrained(self):
+        cfg = self.pretrained_conf
+        if not cfg or not cfg.get("enable", False):
+            return
+        # 若有 resume ckpt，就不要再灌 HF 权重
+        if self.checkpoint_conf.resume_checkpoint_path or get_resume_checkpoint(self.checkpoint_conf.save_dir):
+            return
+    
+        from vggt.models.vggt import VGGT
+    
+        # —— 多卡下载策略（安全做法）——
+        # rank0 允许联网，其它 rank 等 barrier 后从本地缓存读取
+        local_only = cfg.get("local_files_only", True)
+        if self.rank == 0:
+            hf_model = VGGT.from_pretrained(
+                cfg.get("hf_repo", "facebook/VGGT-1B"),
+                local_files_only=local_only,  # 首次下载可设 False
+                revision=cfg.get("hf_revision", None),
+            )
+            state = hf_model.state_dict()
+            del hf_model
+            # 如需键名清洗：
+            prefix = cfg.get("key_prefix_to_strip", None)
+            if prefix:
+                state = { (k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state.items() }
+    
+            # 只保留能对上的键（可减少 unexpected）
+            if cfg.get("only_matching", True):
+                model_keys = set(self.model.state_dict().keys())
+                state = {k: v for k, v in state.items() if k in model_keys}
+    
+            strict = not cfg.get("ignore_missing", True)
+            missing, unexpected = self.model.load_state_dict(state, strict=strict)
+            if self.rank == 0:
+                logging.info(f"[pretrained] loaded {len(state)} keys; missing={len(missing)}, unexpected={len(unexpected)}")
+    
+        # 同步，确保其它 rank 在缓存可用后再继续
+        dist.barrier()
+
 
     def save_checkpoint(self, epoch: int, checkpoint_names: Optional[List[str]] = None):
         """
@@ -866,3 +914,15 @@ def get_chunk_from_data(data: Any, chunk_id: int, num_chunks: int) -> Any:
     else:
         return data
 
+def summary_named_children(m, depth=1, prefix=""):
+    for name, child in m.named_children():
+        n_params = sum(p.numel() for p in child.parameters(recurse=True))
+        n_train = sum(p.numel() for p in child.parameters(recurse=True) if p.requires_grad)
+        print(f"{prefix}{name}: params={n_params/1e6:.2f}M trainable={n_train/1e6:.2f}M")
+        if depth > 1:
+            summary_named_children(child, depth-1, prefix + "  ")
+
+def peek_param_names(m, k=20):
+    for i, (n, p) in enumerate(m.named_parameters()):
+        if i >= k: break
+        print(f"{i:02d}: {n}  {tuple(p.shape)}")

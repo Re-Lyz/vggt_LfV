@@ -231,12 +231,10 @@ class C3VDDatasetv1(BaseDataset):
             point_masks.append(point_mask)
             original_sizes.append(original_size)
 
-        # ids 输出为 list，兼容序列化
-        ids_out = ids.tolist() if isinstance(ids, np.ndarray) else list(ids)
 
         batch = {
             "seq_name": "c3vd_" + seq_name,
-            "ids": ids_out,
+            "ids": ids,
             "frame_num": len(extrinsics),
             "images": images,
             "depths": depths,
@@ -249,14 +247,14 @@ class C3VDDatasetv1(BaseDataset):
         }
 
         if getattr(self, "debug", False):
-            batch["_debug_image_paths"] = [meta[int(i)]["color_path"] for i in ids_out]
+            batch["_debug_image_paths"] = [meta[int(i)]["color_path"] for i in ids]
             batch["_debug_depth_paths"] = [
                 meta[int(i)]["depth_path"] if osp.isfile(meta[int(i)]["depth_path"]) else None
-                for i in ids_out
+                for i in ids
             ]
             batch["_debug_occ_paths"] = [
                 meta[int(i)]["occ_path"] if osp.isfile(meta[int(i)]["occ_path"]) else None
-                for i in ids_out
+                for i in ids
             ]
 
         return batch
