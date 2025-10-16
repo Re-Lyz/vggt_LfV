@@ -14,25 +14,16 @@ Inference backbone.
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-import json
 from tqdm import tqdm
 import torch
-from collections import defaultdict
 import torch.nn as nn
-import os
-import torch
 import torch.distributed as dist
-import contextlib
-from datetime import timedelta
+import os, json
+from pathlib import Path
+from collections import defaultdict
 
 # utils：配置 / IO / 随机种子 / 基础IO工具
-from utils import (
-    load_config,           # (cfg_path:str|Path) -> dict
-    dump_config,           # (cfg:dict, out_dir:str|Path, filename:str="config_snapshot.yaml") -> None
-    set_seed,              # (seed:int=42) -> None
-    ensure_dir,            # (path:str|Path) -> None
-    dump_json,             # (obj:Any, path:str|Path) -> None
-)
+from utils import *
 
 # models：设备/精度策略与模型封装（占位）+ 微调相关占位
 from models.vggt_wrapper import (
@@ -72,59 +63,45 @@ class _DPInferAdapter(nn.Module):
         return self.wrapper.infer_images(images, query_points=query_points)
 
 
-
-def dist_is_ready() -> bool:
-    return dist.is_available() and dist.is_initialized()
-
-def get_rank() -> int:
-    return dist.get_rank() if dist_is_ready() else 0
-
-def get_world_size() -> int:
-    return dist.get_world_size() if dist_is_ready() else 1
-
-def setup_ddp(backend: str = "nccl", timeout_minutes: int = 60):
-    """
-    依赖 torchrun 注入的环境变量：RANK / WORLD_SIZE / LOCAL_RANK
-    """
-    if not dist.is_available() or dist_is_ready():
-        return
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-    
-    dist.init_process_group(
-        backend=backend,
-        init_method="env://",
-        timeout=timedelta(minutes=timeout_minutes),  # ← 用 datetime.timedelta
-        rank=rank,
-        world_size=world_size,
-    )
-
-
-def cleanup_ddp():
-    if dist_is_ready():
-        dist.destroy_process_group()
-
-
 # -----------------------
 # 公共：一次前向（推理）
 # -----------------------
 def _forward_infer(
-    model: nn.Module,
+    model,
     images: torch.Tensor,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     query_points: Optional[torch.Tensor] = None,
+    **extra,  # 预留：有需要时可透传 intrinsics/extrinsics/masks 等
 ):
-    with torch.no_grad():
-        use_amp = (images.is_cuda and amp_enabled)
-        ctx = torch.cuda.amp.autocast(dtype=amp_dtype) if use_amp else contextlib.nullcontext()
-        with ctx:
-            # 这里 model 是 DDP 包裹的 _DPInferAdapter，直接调用即可
-            return model(images, query_points)
+    """
+    单次前向：对子批 (s:e) 做 no_grad + 可选 autocast。
+    - model 可以是 DDP 包裹的 _DPInferAdapter；
+    - 不在这里 .to(device)，外层已搬到正确 device；
+    - 返回值保持模型原样（通常为 dict）。
+    """
+    # 组装 forward 的参数
+    fwd_kwargs = {"images": images}
+    if query_points is not None:
+        fwd_kwargs["query_points"] = query_points
+    if extra:
+        fwd_kwargs.update(extra)
+
+    # 选择 autocast 的 device_type（以 images 为准，若无则看是否有 CUDA）
+    if torch.is_tensor(images) and images.is_cuda:
+        device_type = "cuda"
+    else:
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 前向（不做 grad、可选 AMP）
+    if amp_enabled:
+        with torch.no_grad(), torch.autocast(device_type=device_type, dtype=amp_dtype):
+            preds = model(**fwd_kwargs)
+    else:
+        with torch.no_grad():
+            preds = model(**fwd_kwargs)
+
+    return preds
 
 
 
@@ -132,6 +109,21 @@ def _forward_infer(
 # 推理主流程
 # -----------------------
 def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, args=None):
+    """
+    分块-分发-并行前向-汇总拼接 的分布式推理版本：
+    - 不再按序列在 rank 间轮转切分；
+    - 同一条序列按 inference.max_img_per_gpu 切 chunk，round-robin 分给各 rank；
+    - 各 rank 仅前向自己领取的 (s,e) 子段；
+    - 用 dist.gather_object 把 (s,e,preds_chunk) 收拢到 rank0，按时间维拼回完整序列；
+    - 评估与可视化、序列 metrics 与最终 summary 的逻辑保持不变，均在 rank0 执行。
+    依赖的功能函数（请在文件其他位置或 utils 中提供）：
+        build_chunks(total_T:int, chunk_size:int) -> list[(s,e)]
+        shard_chunks_for_rank(chunks, rank:int, world_size:int) -> list[(s,e)]
+        slice_align(x, s:int, e:int) -> 同步对齐切片
+        merge_preds_chunks(gathered_per_rank: list[list[(s,e,preds_dict)]]) -> dict(按维度0拼接)
+    """
+
+
     out_root = Path(cfg.get("output_dir", "outputs/infer"))
     ensure_dir(out_root)
     dump_config(cfg, out_root)
@@ -141,7 +133,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
     use_ddp = bool(ddp_conf.get("ddp", False))
     only_rank0_visual = bool(ddp_conf.get("only_rank0_visual", True))
     use_rank_subdir = bool(ddp_conf.get("rank_output_subdir", True))
-    infer_cap = int(ddp_conf.get("max_img_per_gpu", -1))
+    infer_cap = int(ddp_conf.get("max_img_per_gpu", -1))  # 现在语义：chunk_size；<=0 表示整段
 
     if use_ddp and torch.cuda.is_available():
         setup_ddp(
@@ -151,11 +143,9 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
     else:
-        # 单卡路径（不初始化进程组）
         device = "cuda:0" if (device == "auto" and torch.cuda.is_available()) else device
 
     # ===== 构建模型 =====
-    # 包一层适配器以便 DDP 正常 forward（适配器内部调用 wrapper.infer_images）
     wrapper = VGGTWrapper(device=device, amp_dtype=amp_dtype, amp_enabled=amp_enabled)
     model = _DPInferAdapter(wrapper).to(device)
 
@@ -168,7 +158,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
             find_unused_parameters=False,
         )
 
-    # ===== 数据集 & 序列划分（DDP 每个 rank 处理不重叠子集）=====
+    # ===== 数据集（所有 rank 同步遍历相同序列）=====
     loader = get_dataset_loader(cfg)
     seq_ids = loader.list_sequences()
     limit = cfg.get("dataset", {}).get("limit_seqs", -1)
@@ -177,35 +167,37 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
 
     rank = get_rank()
     world_size = get_world_size()
-    if use_ddp and world_size > 1:
-        seq_ids = seq_ids[rank::world_size]  # 轮转切分，避免重复
 
-    # ===== 推理主循环 =====
+    # 关键改动：不再对 seq_ids 做 rank 级切分（seq_ids[rank::world_size]）
+    iterator = tqdm(seq_ids, desc="Inference") if rank == 0 else seq_ids
+
+    # ===== 指标收集容器（最终仍然 summary）=====
     all_seq_depth_metrics = []
     pose_collect = defaultdict(lambda: {"APE": defaultdict(list), "RPE": defaultdict(list)})
 
-    iterator = tqdm(seq_ids, desc="Inference") if rank == 0 else seq_ids
     for seq_id in iterator:
         try:
             seq_item = loader.build_sequence(seq_id)
-            seq_out = out_root / seq_item.meta.get("sequence_name", f"seq_{seq_id}")
+            seq_name = seq_item.meta.get("sequence_name", f"seq_{seq_id}")
+            seq_out = out_root / seq_name
 
-            # rank 输出目录策略
+            # rank 输出目录策略（评估只在 rank0 执行，但目录创建保持不变）
             if rank == 0 or not use_rank_subdir:
                 out_dir_this_root = seq_out
             else:
                 out_dir_this_root = seq_out / f"rank{rank}"
             ensure_dir(out_dir_this_root)
 
-            # 读取并预处理图像到当前设备
+            # 读取并预处理全序列图像到当前设备（每个 rank 都加载；随后各自按 (s,e) 切片）
             images = loader.load_and_preprocess_images(seq_item.images, device=device)
+            T = images.shape[0] if torch.is_tensor(images) else len(images)
 
-            # 可选：限制每次前向的帧上限（以帧计的 minibatch cap）
-            if isinstance(images, torch.Tensor) and images.dim() >= 1 and infer_cap > 0:
-                if images.shape[0] > infer_cap:
-                    images = images[:infer_cap]
+            # 分块（<=0 表示整段作为一个块）
+            chunk_size = infer_cap if (infer_cap and infer_cap > 0) else T
+            chunks_all = build_chunks(T, chunk_size)                     # e.g. [(0,32),(32,64),...]
+            chunks_my = shard_chunks_for_rank(chunks_all, rank, world_size)  # round-robin 分给当前 rank
 
-            # （可选）查询点
+            # （可选）查询点等“按帧对齐”的键
             query_points = None
             if hasattr(loader, "load_and_preprocess_query_points"):
                 try:
@@ -213,61 +205,83 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
                 except Exception:
                     query_points = None
 
-            # === 前向推理 ===
-            preds = _forward_infer(
-                model=model,
-                images=images,
-                amp_enabled=amp_enabled,
-                amp_dtype=amp_dtype,
-                query_points=query_points,
-            )
+            # === 本 rank 仅推理自己领取到的 chunk ===
+            local_results = []  # [(s, e, preds_chunk_dict), ...]
+            for (s, e) in chunks_my:
+                sub_images = slice_align(images, s, e)
+                sub_qpts = slice_align(query_points, s, e)
 
-            # === 位姿评估 ===
-            cam_cfg = cfg.get("evaluation", {}).get("camera", {})
-            if cam_cfg.get("enabled", True):
-                cam_cfg_eff = dict(cam_cfg)
-                # 非 rank0 禁用绘图，避免并发可视化冲突
-                if only_rank0_visual and rank != 0:
-                    cam_cfg_eff["plot_3d"] = False
-
-                pose_results_by_mode = evaluate_and_visualize_poses(
-                    preds=preds,
-                    seq_item=seq_item,
-                    out_dir=out_dir_this_root,
-                    camera_cfg=cam_cfg_eff,
+                preds_chunk = _forward_infer(
+                    model=model,
+                    images=sub_images,
+                    amp_enabled=amp_enabled,
+                    amp_dtype=amp_dtype,
+                    query_points=sub_qpts,
                 )
-                for mode, res in pose_results_by_mode.items():
-                    for mname, mdict in res.items():
-                        for k, v in mdict.items():
-                            if isinstance(v, (int, float)):
-                                pose_collect[mode][mname][k].append(v)
+                if isinstance(preds_chunk, dict):
+                    local_results.append((s, e, preds_chunk))
+                else:
+                    local_results.append((s, e, {"_preds": preds_chunk}))
 
-            # === 深度评估 ===
-            depth_cfg = cfg.get("evaluation", {}).get("depth", {"enabled": True})
-            if depth_cfg.get("enabled", True):
-                depth_cfg_eff = dict(depth_cfg)
-                # 如需也在非 rank0 关闭可视化，可在这里调整 depth_cfg_eff 的相关开关
-                depth_metrics = evaluate_sequence_depth(
-                    preds=preds,
-                    gt_paths=seq_item.gt.get("depth_paths", []),
-                    masks=seq_item.gt.get("valid_masks", None),
-                    depth_cfg=depth_cfg_eff,
-                    out_dir=out_dir_this_root,
-                )
-                all_seq_depth_metrics.append(depth_metrics)
+            # === 多卡收拢（按序列级）到 rank0 ===
+            if use_ddp and world_size > 1:
+                gathered = [None for _ in range(world_size)] if rank == 0 else None
+                dist.gather_object(local_results, gathered, dst=0)
             else:
-                depth_metrics = {}
+                gathered = [local_results]  # 单卡情形
 
-            # 每序列的 metrics 快速落盘
-            dump_json({
-                "sequence": seq_item.meta.get("sequence_name", str(seq_id)),
-                "depth": depth_metrics,
-            }, out_dir_this_root / "metrics_summary.json")
+            # === rank0：按时间维拼回整条序列的预测，并评估/落盘 ===
+            if rank == 0:
+                merged_preds = merge_preds_chunks(gathered)  # dict: 每个键维度0拼成 T
+
+                # === 位姿评估（保持你的原逻辑）===
+                cam_cfg = cfg.get("evaluation", {}).get("camera", {})
+                if cam_cfg.get("enabled", True):
+                    cam_cfg_eff = dict(cam_cfg)
+                    if only_rank0_visual:
+                        # rank0 可视化开关按照你的配置；其它 rank 本来就不评估
+                        pass
+                    pose_results_by_mode = evaluate_and_visualize_poses(
+                        preds=merged_preds,
+                        seq_item=seq_item,
+                        out_dir=out_dir_this_root,
+                        camera_cfg=cam_cfg_eff,
+                    )
+                    for mode, res in pose_results_by_mode.items():
+                        for mname, mdict in res.items():
+                            for k, v in mdict.items():
+                                if isinstance(v, (int, float)):
+                                    pose_collect[mode][mname][k].append(v)
+
+                # === 深度评估（保持你的原逻辑）===
+                depth_cfg = cfg.get("evaluation", {}).get("depth", {"enabled": True})
+                if depth_cfg.get("enabled", True):
+                    depth_cfg_eff = dict(depth_cfg)
+                    depth_metrics = evaluate_sequence_depth(
+                        preds=merged_preds,
+                        gt_paths=seq_item.gt.get("depth_paths", []),
+                        masks=seq_item.gt.get("valid_masks", None),
+                        depth_cfg=depth_cfg_eff,
+                        out_dir=out_dir_this_root,
+                    )
+                    all_seq_depth_metrics.append(depth_metrics)
+                else:
+                    depth_metrics = {}
+
+                # 每序列的 metrics 快速落盘（保持你的原逻辑）
+                dump_json({
+                    "sequence": seq_name,
+                    "depth": depth_metrics,
+                }, out_dir_this_root / "metrics_summary.json")
+
+            # 各 rank 在此序列结束处同步
+            if dist_is_ready():
+                dist.barrier()
 
         except Exception as e:
             print(f"[WARN][rank {rank}] sequence {seq_id} failed: {e}")
 
-    # ===== 跨 rank 汇总到 rank0 =====
+    # ===== 跨 rank 汇总到 rank0（接口保留；非 rank0 此时基本无结果）=====
     if use_ddp and world_size > 1:
         gather_list = [None for _ in range(world_size)] if rank == 0 else None
         dist.gather_object(
@@ -275,11 +289,12 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
             gather_list=gather_list,
             dst=0,
         )
-
         if rank == 0:
             merged_depth = []
             merged_pose = defaultdict(lambda: {"APE": defaultdict(list), "RPE": defaultdict(list)})
             for it in gather_list:
+                if it is None:
+                    continue
                 merged_depth.extend(it["depth"])
                 for mode, groups in it["pose"].items():
                     for mname, stats in groups.items():
@@ -288,7 +303,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
             all_seq_depth_metrics = merged_depth
             pose_collect = merged_pose
 
-    # ===== 只有 rank0 写最终汇总 =====
+    # ===== 只有 rank0 写最终汇总（保持你的原逻辑）=====
     if rank == 0:
         summary = {}
         if all_seq_depth_metrics:
@@ -307,7 +322,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
         dump_json({"summary": summary, "num_sequences": len(loader.list_sequences())}, out_root / "summary.json")
         print("[rank0] Inference done. Summary:", json.dumps(summary, indent=2, ensure_ascii=False))
 
-    if use_ddp and dist_is_ready():
+    if dist_is_ready():
         cleanup_ddp()
 
 # def test(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, args=None):
