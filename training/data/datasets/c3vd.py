@@ -191,8 +191,10 @@ class C3VDDatasetv1(BaseDataset):
             # 1) 读图（图像本身仍按实际尺寸加载；K 已按 common_conf 的 H,W 生成）
             image = read_image_cv2(color_path)
             if image is None:
+                # 这里最好打印一条可定位的信息，避免静默跳样本
+                print(f"[warn] fail to read image: {color_path}")
                 continue
-
+            
             # 2) 读深度（可选）并处理 occlusion
             if self.load_depth and osp.isfile(anno["depth_path"]):
                 depth_map = read_depth_any(anno["depth_path"], self.depth_unit_scale)
@@ -221,7 +223,27 @@ class C3VDDatasetv1(BaseDataset):
                 target_image_shape=target_image_shape,
                 filepath=color_path
             )
-            print("shape of image after process_one_image:", image.shape)
+             
+            # === 关键：对所有会被 collate 的返回做 C 连续与 dtype 统一 ===
+            image = np.ascontiguousarray(image, dtype=np.uint8)  # 或 float32，视你的下游而定
+            if depth_map is None:
+                # 避免 None 参与 collate；按你的设计返回空阵或全 0，形状要一致
+                depth_map = np.zeros(target_image_shape, dtype=np.float32)
+            else:
+                depth_map = np.ascontiguousarray(depth_map, dtype=np.float32)
+
+            extri_opencv = np.ascontiguousarray(extri_opencv, dtype=np.float32)
+            intri_opencv = np.ascontiguousarray(intri_opencv, dtype=np.float32)
+
+            # 点云/掩膜也要保证连续 & dtype 统一（float32 / uint8）
+            if world_coords_points is not None:
+                world_coords_points = np.ascontiguousarray(world_coords_points, dtype=np.float32)
+            if cam_coords_points is not None:
+                cam_coords_points = np.ascontiguousarray(cam_coords_points, dtype=np.float32)
+            if point_mask is not None:
+                point_mask = np.ascontiguousarray(point_mask, dtype=np.uint8)
+            # print("shape of image after process_one_image:", image.shape)
+            
             images.append(image)
             depths.append(depth_map)
             extrinsics.append(extri_opencv)
@@ -256,7 +278,7 @@ class C3VDDatasetv1(BaseDataset):
                 meta[int(i)]["occ_path"] if osp.isfile(meta[int(i)]["occ_path"]) else None
                 for i in ids
             ]
-        print(f"[C3VD] got_frames={len(images)} target={img_per_seq}")
+        # print(f"[C3VD] got_frames={len(images)} target={img_per_seq}")
         return batch
     
     

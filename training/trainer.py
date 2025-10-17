@@ -155,7 +155,8 @@ class Trainer:
         # Construct optimizers (after moving model to device)
         if self.mode != "val":
             self.optims = construct_optimizers(self.model, self.optim_conf)
-
+        self._report_model_and_optim_memory(where="post_optim_init")
+        
         # Load checkpoint if available or specified
         if self.checkpoint_conf.resume_checkpoint_path is not None:
             self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
@@ -304,7 +305,6 @@ class Trainer:
             bucket_cap_mb=distributed_conf.bucket_cap_mb,
             broadcast_buffers=distributed_conf.broadcast_buffers,
         )
-
         self.model = nn.parallel.DistributedDataParallel(
             self.model,
             device_ids=[self.local_rank] if device == "cuda" else [],
@@ -320,7 +320,7 @@ class Trainer:
             return
     
         from vggt.models.vggt import VGGT
-    
+        logging.info(f"[pretrained] Loading VGG-T pretrained weights from HF repo {cfg.get('hf_repo', 'facebook/VGGT-1B')}")    
         # —— 多卡下载策略（安全做法）——
         # rank0 允许联网，其它 rank 等 barrier 后从本地缓存读取
         local_only = cfg.get("local_files_only", True)
@@ -544,23 +544,28 @@ class Trainer:
 
         return True
 
-    def train_epoch(self, train_loader):        
+    def train_epoch(self, train_loader): 
+        
+        mem_report_freq = getattr(self.logging_conf, "mem_report_freq", 100)  # 可在 YAML 里配
+        is_rank0 = (self.rank == 0 and torch.cuda.is_available())
+
+        if is_rank0:
+            torch.cuda.reset_peak_memory_stats()
+            
+   
         batch_time = AverageMeter("Batch Time", self.device, ":.4f")
         data_time = AverageMeter("Data Time", self.device, ":.4f")
         mem = AverageMeter("Mem (GB)", self.device, ":.4f")
         data_times = []
         phase = 'train'
-        
         loss_names = self._get_scalar_log_keys(phase)
         loss_names = [f"Loss/{phase}_{name}" for name in loss_names]
         loss_meters = {
             name: AverageMeter(name, self.device, ":.4f") for name in loss_names
         }
-        
         for config in self.gradient_clipper.configs: 
             param_names = ",".join(config['module_names'])
             loss_meters[f"Grad/{param_names}"] = AverageMeter(f"Grad/{param_names}", self.device, ":.4f")
-
         # print("train_loader:", train_loader)
         progress = ProgressMeter(
             num_batches=len(train_loader),
@@ -574,51 +579,42 @@ class Trainer:
             real_meters={},
             prefix="Train Epoch: [{}]".format(self.epoch),
         )
-
         self.model.train()
         end = time.time()
-
         iters_per_epoch = len(train_loader)
         limit_train_batches = (
             iters_per_epoch
             if self.limit_train_batches is None
             else self.limit_train_batches
         )
-        
         if self.gradient_clipper is not None:
             # setup gradient clipping at the beginning of training
             self.gradient_clipper.setup_clipping(self.model)
-
+            
+            
         for data_iter, batch in enumerate(train_loader):
             if data_iter > limit_train_batches:
                 break
-            
+             
             # measure data loading time
             data_time.update(time.time() - end)
             data_times.append(data_time.val)
-
-            
             with torch.cuda.amp.autocast(enabled=False):
                 batch = self._process_batch(batch)
-
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
-            print("After copy_data_to_device, batch['images'].shape:", batch['images'].shape)
+            # print("After copy_data_to_device, batch['images'].shape:", batch['images'].shape)
             accum_steps = self.accum_steps
-
             if accum_steps==1:
                 chunked_batches = [batch]
             else:
                 chunked_batches = chunk_batch_for_accum_steps(batch, accum_steps)
-
             self._run_steps_on_batch_chunks(
                 chunked_batches, phase, loss_meters
             )
-
             # compute gradient and do SGD step
             assert data_iter <= limit_train_batches  # allow for off by one errors
             exact_epoch = self.epoch + float(data_iter) / limit_train_batches
             self.where = float(exact_epoch) / self.max_epochs
-            
             assert self.where <= 1 + self.EPSILON
             if self.where < 1.0:
                 for optim in self.optims:
@@ -627,7 +623,6 @@ class Trainer:
                 logging.warning(
                     f"Skipping scheduler update since the training is at the end, i.e, {self.where} of [0,1]."
                 )
-                    
             # Log schedulers
             if self.steps[phase] % self.logging_conf.log_freq == 0:
                 for i, optim in enumerate(self.optims):
@@ -652,32 +647,42 @@ class Trainer:
                     self.where,
                     self.steps[phase],
                 )
-
             # Clipping gradients and detecting diverging gradients
             if self.gradient_clipper is not None:
                 for optim in self.optims:
                     self.scaler.unscale_(optim.optimizer)
-
                 grad_norm_dict = self.gradient_clipper(model=self.model)
-
                 for key, grad_norm in grad_norm_dict.items():
                     loss_meters[f"Grad/{key}"].update(grad_norm)
-
             # Optimizer step
             for optim in self.optims:   
                 self.scaler.step(optim.optimizer)
             self.scaler.update()
-
             # Measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
             self.time_elapsed_meter.update(
                 time.time() - self.start_time + self.ckpt_time_elapsed
             )
-            mem.update(torch.cuda.max_memory_allocated() // 1e9)
+            
+            # 用当前分配更新进度条上的内存
+            mem.update(torch.cuda.memory_allocated() / 1e9)
 
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
+
+            # 每 N 步打印显存窗口
+            if is_rank0 and (data_iter % mem_report_freq == 0):
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated()
+                cur_alloc = torch.cuda.memory_allocated()
+                cur_reserved = torch.cuda.memory_reserved()
+                logging.info(
+                    f"[mem/step {self.steps[phase]}] "
+                    f"peak={_fmt_gb(peak)} alloc={_fmt_gb(cur_alloc)} reserved={_fmt_gb(cur_reserved)}"
+                )
+                torch.cuda.reset_peak_memory_stats()  # 窗口化观察
+
 
         return True
 
@@ -864,6 +869,17 @@ class Trainer:
                 name, visuals_to_log, step, self.logging_conf.video_logging_fps
             )
 
+    def _report_model_and_optim_memory(self, where="init"):
+        if not torch.cuda.is_available() or self.rank != 0:
+            return
+        model_obj = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+        bd = model_mem_breakdown(model_obj, getattr(self, "optims", None))
+        logging.info(f"[mem/{where}] params={_fmt_gb(bd['params'])}  grads={_fmt_gb(bd['grads'])}  optim={_fmt_gb(bd['optim'])}")
+        # 当前 CUDA allocator 占用/缓存
+        torch.cuda.synchronize()
+        logging.info(f"[mem/{where}] allocated={_fmt_gb(torch.cuda.memory_allocated())}  reserved={_fmt_gb(torch.cuda.memory_reserved())}")
+
+
 
 
 
@@ -925,3 +941,38 @@ def peek_param_names(m, k=20):
     for i, (n, p) in enumerate(m.named_parameters()):
         if i >= k: break
         print(f"{i:02d}: {n}  {tuple(p.shape)}")
+
+
+# 放在合适的位置（比如 trainer.py 顶部或 utils/mem.py）
+def _bytes_of_tensor(t):
+    import torch
+    return 0 if (t is None or not torch.is_tensor(t)) else t.numel() * t.element_size()
+
+def model_mem_breakdown(model, optim=None):
+    """估算 参数/梯度/优化器状态 占用（字节）。"""
+    import torch
+    params = sum(_bytes_of_tensor(p) for p in model.parameters())
+    grads  = sum(_bytes_of_tensor(p.grad) for p in model.parameters())
+    opt    = 0
+    if optim is not None:
+        opts = optim if isinstance(optim, (list, tuple)) else [optim]
+        for opti in opts:
+            # 兼容你封装的 OptimWrapper：取 opti.optimizer
+            optim_impl = getattr(opti, "optimizer", opti)
+            for group in optim_impl.param_groups:
+                for p in group["params"]:
+                    st = optim_impl.state.get(p, {})
+                    for v in st.values():
+                        if torch.is_tensor(v):
+                            opt += _bytes_of_tensor(v)
+    return {"params": params, "grads": grads, "optim": opt}
+
+def _fmt_gb(nbytes):
+    return f"{nbytes / (1024**3):.2f} GB"
+
+
+
+
+
+
+

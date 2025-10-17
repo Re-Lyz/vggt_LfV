@@ -2,7 +2,7 @@ defaults:
   - custom_dataset.yaml
 
 exp_name: exp001
-img_size: 518
+img_size: 266
 num_workers: 8
 seed_value: 42
 accum_steps: 1    # We did not use gradient accumulation in our training, while if you suffer from OOM, you can try to use it.
@@ -31,7 +31,7 @@ data:
       dataset_configs:
         - _target_: data.datasets.c3vd.C3VDDatasetv1
           split: train
-          ROOT: /home/re_lyz/python/vggt_data/C3VD/registered
+          ROOT: /data/C3VD/C3VDv1/registered
           USE_REGISTERED: True
           
 
@@ -47,7 +47,7 @@ data:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
         - _target_: data.datasets.c3vd.C3VDDatasetv1
-          ROOT: /home/re_lyz/python/vggt_data/C3VD/registered
+          ROOT: /data/C3VD/C3VDv1/registered
           split: test
 
 
