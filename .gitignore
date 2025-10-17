@@ -1,4 +1,5 @@
 infer/outputs
+training/logs
 
 .gradio/
 .hydra/

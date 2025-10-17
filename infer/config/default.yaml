@@ -25,7 +25,7 @@ model:
 # ======= dataset ========
 dataset:
   name: c3vd_v1
-  root: /data/C3VD/C3VDv1/registered
+  root: /home/re_lyz/python/vggt_data/C3VD/registered
   config_file: custom_dataset.yaml   # ← 二级 YAML 文件名，放在主 YAML 同目录
   use_registered: true
   min_num_images: 2
