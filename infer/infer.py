@@ -18,6 +18,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import numpy as np
 import os, json
 from pathlib import Path
 from collections import defaultdict
@@ -62,6 +63,30 @@ class _DPInferAdapter(nn.Module):
         # 直接调用你现有的单卡推理入口
         return self.wrapper.infer_images(images, query_points=query_points)
 
+_DTYPE_CAST = {
+    torch.bfloat16: torch.float32,  # numpy 不支持 bfloat16，先转 float32
+    torch.float16: torch.float32,   # 有些下游算子对 fp16 不稳
+}
+
+def _tensor_to_numpy(t: torch.Tensor) -> np.ndarray:
+    dt = _DTYPE_CAST.get(t.dtype, None)
+    if dt is not None:
+        t = t.to(dt)
+    return t.detach().cpu().numpy()
+
+def tree_to_numpy(x):
+    """仅把 torch.Tensor→numpy；保持原有 dict/list/tuple 结构；其他类型原样返回。"""
+    if torch.is_tensor(x):
+        return _tensor_to_numpy(x)
+    if isinstance(x, dict):
+        return {k: tree_to_numpy(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        out = [tree_to_numpy(v) for v in x]
+        return tuple(out) if isinstance(x, tuple) else out
+    if isinstance(x, (np.ndarray, np.number, float, int, str)) or x is None:
+        return x
+    # 其他罕见类型（Path、bool、自定义类等）直接原样返回
+    return x
 
 # -----------------------
 # 公共：一次前向（推理）
@@ -239,7 +264,8 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
             # === rank0：按时间维拼回整条序列的预测，并评估/落盘 ===
             if rank == 0:
                 merged_preds = merge_preds_chunks(gathered)  # dict: 每个键维度0拼成 T
-
+                print(merged_preds.keys())
+                merged_preds_np = tree_to_numpy(merged_preds)
                 # === 位姿评估（保持你的原逻辑）===
                 cam_cfg = cfg.get("evaluation", {}).get("camera", {})
                 if cam_cfg.get("enabled", True):
@@ -248,7 +274,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
                         # rank0 可视化开关按照你的配置；其它 rank 本来就不评估
                         pass
                     pose_results_by_mode = evaluate_and_visualize_poses(
-                        preds=merged_preds,
+                        preds=merged_preds_np,
                         seq_item=seq_item,
                         out_dir=out_dir_this_root,
                         camera_cfg=cam_cfg_eff,
@@ -264,12 +290,18 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
                 if depth_cfg.get("enabled", True):
                     depth_cfg_eff = dict(depth_cfg)
                     depth_metrics = evaluate_sequence_depth(
-                        preds=merged_preds,
+                        preds=merged_preds_np,
                         gt_paths=seq_item.gt.get("depth_paths", []),
                         masks=seq_item.gt.get("valid_masks", None),
                         depth_cfg=depth_cfg_eff,
                         out_dir=out_dir_this_root,
                     )
+                    
+                    depth_metrics = {
+                        k: (float(v) if isinstance(v, (int, float)) or np.isscalar(v) else v)
+                        for k, v in depth_metrics.items()
+                    }
+                    
                     all_seq_depth_metrics.append(depth_metrics)
                 else:
                     depth_metrics = {}

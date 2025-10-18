@@ -138,27 +138,3 @@ class VGGTWrapper:
                 print("  unexpected:", unexpected)
         print(f"[VGGTWrapper] Loaded custom checkpoint: {ckpt_path}")
 
-# -------------------------
-# 微调相关（占位实现）
-#   * 推理模式不会调用
-#   * 若误用会抛出 NotImplementedError
-# -------------------------
-def build_optimizer(model: VGGTWrapper, cfg: dict):
-    """占位：后续实现优化器构建。"""
-    raise NotImplementedError("build_optimizer is not implemented yet.")
-
-def build_scheduler(optimizer, cfg: dict):
-    """占位：后续实现学习率调度器。"""
-    return None  # 可先返回 None，避免上层判空失败
-
-def training_step(model: VGGTWrapper, batch, device: str, scaler_or_none, amp_dtype: torch.dtype, cfg: dict) -> Dict[str, float]:
-    """占位：后续实现一次训练步（前向、反传、step）。"""
-    raise NotImplementedError("training_step is not implemented yet.")
-
-def eval_step(model: VGGTWrapper, batch, device: str, cfg: dict) -> Dict[str, float]:
-    """占位：后续实现验证前向与指标计算。"""
-    raise NotImplementedError("eval_step is not implemented yet.")
-
-def save_checkpoint(model: VGGTWrapper, optimizer, scheduler, epoch: int, out_dir: Path) -> None:
-    """占位：后续实现保存权重/优化器/调度器状态。"""
-    raise NotImplementedError("save_checkpoint is not implemented yet.")

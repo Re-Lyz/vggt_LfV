@@ -315,34 +315,81 @@ class C3VDDatasetv1(BaseDataset):
 
 class C3VDDatasetV1Adapter:
     """
-    目标接口：
-      - list_sequences() -> List[str]
-      - build_sequence(seq_id) -> SequenceItem
+    目标接口保持不变：
+      - list_sequences() -> List[str]                 # 返回“窗口化”的序列ID
+      - build_sequence(seq_id) -> SequenceItem        # 由窗口ID构造子序列的 paths/gt/meta
       - load_and_preprocess_images(paths, device) -> Tensor[B,3,H,W]
+      - load_and_preprocess_query_points(...) -> None
+
+    主要变化：
+      1) 把 base.data_store[seq] 的帧切成窗口（长度 L，步长 stride 或随机起点）
+      2) seq_id 形如： "seqName|12:60" 表示 [start=12, end=60) 的窗口
+      3) 窗口长度 L 的优先级： common_config.fix_img_num(>0) > ds_cfg.max_img_per_gpu > 48
+      4) inside_random=True 时，窗口内还可随机抽取 L 帧；否则按顺序
+      5) allow_duplicate_img 控制短尾或不足 L 时的补齐策略
     """
 
     def __init__(self, base: C3VDDatasetv1, ds_cfg: dict):
-        self.base = base              # ← 直接使用已经构造好的 C3VDDatasetv1
-        self.ds_cfg = ds_cfg
+        self.base = base
+        self.ds_cfg = ds_cfg or {}
         self.ROOT = getattr(base, "ROOT", None)
 
-        # 用 base 的序列列表
-        self._seq_ids = list(getattr(self.base, "sequence_list", []))
+        # ===== 从 common_config 读取“训练同款”的行为开关 =====
+        cc = getattr(base, "common_conf", None)
+        # L（窗口长度）
+        fix_img_num = getattr(cc, "fix_img_num", -1) if cc else -1
+        max_img_per_gpu = int(self.ds_cfg.get("max_img_per_gpu", 48))
+        self.L = int(fix_img_num) if isinstance(fix_img_num, int) and fix_img_num > 0 else int(max_img_per_gpu)
+        if self.L <= 0:
+            self.L = 48
+
+        # 取样行为
+        self.inside_random = bool(getattr(cc, "inside_random", True)) if cc else bool(self.ds_cfg.get("inside_random", True))
+        self.allow_duplicate_img = bool(getattr(cc, "allow_duplicate_img", True)) if cc else bool(self.ds_cfg.get("allow_duplicate_img", True))
+
+        # 滑窗配置：不设则每条序列仅给一个窗口（随机 / 头对齐）
+        slide_stride = getattr(cc, "slide_stride", None) if cc else self.ds_cfg.get("slide_stride", None)
+        self.slide_stride = None if slide_stride in (None, "null") else int(slide_stride)
+        self.drop_last = bool(getattr(cc, "drop_last", False)) if cc else bool(self.ds_cfg.get("drop_last", False))
+
+        # 评估复现：推理默认固定随机性
+        self.eval_mode = True
+        self._rng = np.random.RandomState(0) if self.eval_mode else np.random
+
+        # 原始序列列表
+        self._seq_names: List[str] = list(getattr(self.base, "sequence_list", []))
+
+        # === 预构建窗口索引 ===
+        # 形式： self._windows = List[ (seq_name, start, end) ]
+        self._windows: List[tuple[str, int, int]] = []
+        self._seq2len: Dict[str, int] = {}
+        self._build_windows()
+
+    # ----------------- 公共接口 -----------------
 
     def list_sequences(self) -> List[str]:
-        limit = int(self.ds_cfg.get("limit_seqs", -1))
-        seqs = self._seq_ids
-        return seqs[:limit] if limit > 0 else seqs
+        """
+        返回窗口化后的“序列ID”列表，每个元素形如 "seqName|start:end"。
+        如果需要限制总窗口数，可以在 ds_cfg 里设 limit_windows（可选）。
+        """
+        ids = [self._encode_wid(sn, s, e) for (sn, s, e) in self._windows]
+        limit = int(self.ds_cfg.get("limit_windows", -1))
+        return ids[:limit] if limit > 0 else ids
 
     def build_sequence(self, seq_id: str) -> SequenceItem:
         """
-        这里 seq_id 是“序列名”（与 base.sequence_list 的元素一致）。
-        用 base.data_store[seq_id] 里的记录直接组路径与 GT。
+        根据窗口ID（seqName|start:end）构造 SequenceItem（只含该窗口内的帧）。
         """
-        if not hasattr(self.base, "data_store") or seq_id not in self.base.data_store:
-            raise KeyError(f"[C3VDDatasetV1Adapter] sequence not found: {seq_id}")
+        seq_name, start, end = self._decode_wid(seq_id)
+        if seq_name not in self.base.data_store:
+            raise KeyError(f"[C3VDDatasetV1Adapter] sequence not found: {seq_name}")
+        frames_all = self.base.data_store[seq_name]
+        n = len(frames_all)
 
-        frames = self.base.data_store[seq_id]   # list of per-frame dict（在构造时已经整理好了）
+        # 真实索引（含窗口内的二次采样与补齐）
+        idxs = self._make_indices(start, end, n)
+
+        frames = [frames_all[i] for i in idxs]
 
         images = [f["color_path"] for f in frames]
         depth_paths   = [f["depth_path"]   for f in frames]
@@ -351,21 +398,24 @@ class C3VDDatasetV1Adapter:
 
         # data_dir：取第一帧所在目录
         from os.path import dirname
-        data_dir = dirname(images[0]) if images else (self.ROOT and str(Path(self.ROOT, seq_id)))
+        data_dir = dirname(images[0]) if images else (self.ROOT and str(Path(self.ROOT, seq_name)))
 
         gt = {
             "depth_paths": depth_paths,
             "valid_masks": mask_paths,
             "normals_paths": normals_paths,
-            # 需要的话也可以把 K / extrinsics 打包进来
+            # 如需可额外传：intrinsics / extrinsics
             # "intrinsics": [f["K"] for f in frames],
             # "extrinsics_w2c": [f["extri_w2c"] for f in frames],
+            "global_ids": [f["frame_idx"] for f in frames],  # 回拼评估时有用
         }
         meta = {
-            "sequence_name": seq_id,
-            "sequence_dir": str(Path(self.ROOT, seq_id)) if self.ROOT else None,
+            "sequence_name": seq_name,
+            "sequence_dir": str(Path(self.ROOT, seq_name)) if self.ROOT else None,
             "data_dir": data_dir,
-            "pose_txt": str(Path(self.ROOT, seq_id, "pose.txt")) if self.ROOT else None,
+            "pose_txt": str(Path(self.ROOT, seq_name, "pose.txt")) if self.ROOT else None,
+            "window_range": (int(start), int(end)),
+            "window_length": int(self.L),
         }
         return SequenceItem(images=images, gt=gt, meta=meta)
 
@@ -378,29 +428,120 @@ class C3VDDatasetV1Adapter:
                 return self.base.load_and_preprocess_images(image_paths).to(device)
             except Exception:
                 pass
-        # 2) 官方 VGGT
+        # 2) VGGT 官方兜底
         try:
             from vggt.utils.load_fn import load_and_preprocess_images as official
             return official(image_paths).to(device)
         except Exception:
             pass
-        # 3) 兜底
+        # 3) 最终兜底
         return _stack_rgb_as_tensor(image_paths, device=device)
-    
-    def load_and_preprocess_query_points(self, seq_item, device: str):
-        """
-        Placeholder(空实现)：
-        - 期望将查询点处理成 tensor 返回：
-            torch.Tensor 形状 [N, 2] 或 [B, N, 2]（像素坐标）
-        - 当前返回 None，表示不提供查询点；VGGT 将跳过 tracking 分支
-        - 未来可以从 seq_item.gt 或你的标注中解析并做归一化/滤除等预处理
 
-        Args:
-            seq_item: SequenceItem，包含 images / gt / meta
-            device:  "cuda" 或 "cpu"，可用于把结果放到目标设备
-        Returns:
-            None  (占位)
-        """
+    def load_and_preprocess_query_points(self, seq_item, device: str):
         return None
+
+    # ----------------- 内部方法 -----------------
+
+    def _build_windows(self):
+        self._windows.clear()
+        self._seq2len.clear()
+
+        for sn in self._seq_names:
+            frames = self.base.data_store.get(sn, [])
+            n = len(frames)
+            self._seq2len[sn] = n
+            if n <= 0:
+                continue
+
+            if self.slide_stride is not None and self.slide_stride > 0:
+                # —— 滑动窗口 —— 与训练中 shuffle=False、inside_random=False 的稳定行为相似
+                stride = int(self.slide_stride)
+                starts = list(range(0, max(1, n - self.L + 1), stride))
+                for s in starts:
+                    e = s + self.L
+                    if e <= n:
+                        self._windows.append((sn, s, e))
+                # 尾窗（右对齐）：确保覆盖到序列末尾
+                if not self.drop_last and (n < self.L or (n - self.L) % stride != 0):
+                    s = max(0, n - self.L)
+                    e = s + self.L
+                    if (sn, s, e) not in self._windows:
+                        self._windows.append((sn, s, e))
+            else:
+                # —— 随机选择一个窗口（推理通常每序列一个就够）——
+                if n >= self.L:
+                    if self.inside_random:
+                        s = int(self._rng.randint(0, n - self.L + 1))
+                    else:
+                        s = 0
+                    e = s + self.L
+                    self._windows.append((sn, s, e))
+                else:
+                    # 过短也给一个窗口（0, n），后续 _make_indices 里再补齐到 L
+                    self._windows.append((sn, 0, n))
+
+        # 可选：限制每条序列的窗口数量
+        limit_per_seq = int(self.ds_cfg.get("limit_windows_per_seq", -1))
+        if limit_per_seq > 0 and self.slide_stride is not None:
+            filtered = []
+            seen = {}
+            for sn, s, e in self._windows:
+                cnt = seen.get(sn, 0)
+                if cnt < limit_per_seq:
+                    filtered.append((sn, s, e))
+                    seen[sn] = cnt + 1
+            self._windows = filtered
+
+    def _make_indices(self, start: int, end: int, n: int) -> List[int]:
+        """
+        从 [start, end) 生成长度为 L 的帧索引：
+         - 若 end-start >= L：
+              inside_random=True  ⇒ 在窗口内随机选 L 帧并排序
+              inside_random=False ⇒ 直接取 start..start+L-1
+         - 若不足 L：按 allow_duplicate_img 规则补齐
+        """
+        start = int(start); end = int(end)
+        length = max(0, min(end, n) - max(0, start))
+
+        if length >= self.L:
+            if self.inside_random:
+                chosen = sorted(self._rng.choice(np.arange(start, start + length), size=self.L, replace=False))
+                return [int(i) for i in chosen]
+            else:
+                return list(range(start, start + self.L))
+
+        # 不足 L：补齐
+        base_idxs = list(range(start, start + length))
+        if length <= 0:
+            # 极端情况：序列空或窗口越界，退化为重复最后一帧 0
+            fill_val = min(max(n - 1, 0), n - 1) if n > 0 else 0
+            return [fill_val] * self.L
+
+        if self.allow_duplicate_img:
+            # 重复最后一帧到 L
+            pad = [base_idxs[-1]] * (self.L - length)
+            return base_idxs + pad
+        else:
+            # 循环补齐
+            idxs = []
+            while len(idxs) < self.L:
+                take = min(length, self.L - len(idxs))
+                idxs.extend(base_idxs[:take])
+            return idxs
+
+    @staticmethod
+    def _encode_wid(seq_name: str, start: int, end: int) -> str:
+        return f"{seq_name}|{int(start)}:{int(end)}"
+
+    @staticmethod
+    def _decode_wid(seq_id: str) -> tuple[str, int, int]:
+        # 兼容纯序列名（无窗口参数）的旧用法：退化为整段
+        if "|" not in seq_id:
+            name = seq_id
+            start, end = 0, 1 << 30
+            return name, start, end
+        name, rng = seq_id.split("|", 1)
+        s, e = rng.split(":")
+        return name, int(s), int(e)
     
     
