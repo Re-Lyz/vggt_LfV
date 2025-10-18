@@ -315,112 +315,91 @@ class C3VDDatasetv1(BaseDataset):
 
 class C3VDDatasetV1Adapter:
     """
-    目标接口保持不变：
-      - list_sequences() -> List[str]                 # 返回“窗口化”的序列ID
-      - build_sequence(seq_id) -> SequenceItem        # 由窗口ID构造子序列的 paths/gt/meta
-      - load_and_preprocess_images(paths, device) -> Tensor[B,3,H,W]
-      - load_and_preprocess_query_points(...) -> None
-
-    主要变化：
-      1) 把 base.data_store[seq] 的帧切成窗口（长度 L，步长 stride 或随机起点）
-      2) seq_id 形如： "seqName|12:60" 表示 [start=12, end=60) 的窗口
-      3) 窗口长度 L 的优先级： common_config.fix_img_num(>0) > ds_cfg.max_img_per_gpu > 48
-      4) inside_random=True 时，窗口内还可随机抽取 L 帧；否则按顺序
-      5) allow_duplicate_img 控制短尾或不足 L 时的补齐策略
+    多序列 + 分层均匀抽样（无窗口）
+    - list_sequences(): 返回所有序列名
+    - build_sequence(seq_id): 对该序列均匀抽 K 张（不够全取；可选补齐到 K）
     """
-
     def __init__(self, base: C3VDDatasetv1, ds_cfg: dict):
+        import numpy as np
         self.base = base
         self.ds_cfg = ds_cfg or {}
         self.ROOT = getattr(base, "ROOT", None)
 
-        # ===== 从 common_config 读取“训练同款”的行为开关 =====
-        cc = getattr(base, "common_conf", None)
-        # L（窗口长度）
-        fix_img_num = getattr(cc, "fix_img_num", -1) if cc else -1
-        max_img_per_gpu = int(self.ds_cfg.get("max_img_per_gpu", 48))
-        self.L = int(fix_img_num) if isinstance(fix_img_num, int) and fix_img_num > 0 else int(max_img_per_gpu)
-        if self.L <= 0:
-            self.L = 48
+        strat = (self.ds_cfg.get("stratified_eval") or {})
+        self.k_per_seq   = int(strat.get("num_samples_per_seq", 32))  # 每序列抽样张数 K
+        self.jitter      = bool(strat.get("jitter", False))           # 桶内随机
+        self.seed        = int(strat.get("seed", 0))                  # 随机种子
+        self.pad_to_k    = bool(strat.get("pad_to_k", False))         # 不足是否补齐到 K
+        self.pad_mode    = str(strat.get("pad_mode", "repeat"))       # repeat / loop
 
-        # 取样行为
-        self.inside_random = bool(getattr(cc, "inside_random", True)) if cc else bool(self.ds_cfg.get("inside_random", True))
-        self.allow_duplicate_img = bool(getattr(cc, "allow_duplicate_img", True)) if cc else bool(self.ds_cfg.get("allow_duplicate_img", True))
+        self._rng = np.random.RandomState(self.seed)
+        self._seq_names = list(getattr(self.base, "sequence_list", []))
+        self._seq2len   = {sn: len(self.base.data_store.get(sn, [])) for sn in self._seq_names}
 
-        # 滑窗配置：不设则每条序列仅给一个窗口（随机 / 头对齐）
-        slide_stride = getattr(cc, "slide_stride", None) if cc else self.ds_cfg.get("slide_stride", None)
-        self.slide_stride = None if slide_stride in (None, "null") else int(slide_stride)
-        self.drop_last = bool(getattr(cc, "drop_last", False)) if cc else bool(self.ds_cfg.get("drop_last", False))
-
-        # 评估复现：推理默认固定随机性
-        self.eval_mode = True
-        self._rng = np.random.RandomState(0) if self.eval_mode else np.random
-
-        # 原始序列列表
-        self._seq_names: List[str] = list(getattr(self.base, "sequence_list", []))
-
-        # === 预构建窗口索引 ===
-        # 形式： self._windows = List[ (seq_name, start, end) ]
-        self._windows: List[tuple[str, int, int]] = []
-        self._seq2len: Dict[str, int] = {}
-        self._build_windows()
-
-    # ----------------- 公共接口 -----------------
-
+    # ---------- 公共接口 ----------
     def list_sequences(self) -> List[str]:
-        """
-        返回窗口化后的“序列ID”列表，每个元素形如 "seqName|start:end"。
-        如果需要限制总窗口数，可以在 ds_cfg 里设 limit_windows（可选）。
-        """
-        ids = [self._encode_wid(sn, s, e) for (sn, s, e) in self._windows]
-        limit = int(self.ds_cfg.get("limit_windows", -1))
-        return ids[:limit] if limit > 0 else ids
+        limit = int(self.ds_cfg.get("limit_seqs", -1) or -1)
+        seqs = self._seq_names
+        return seqs[:limit] if limit > 0 else seqs
 
     def build_sequence(self, seq_id: str) -> SequenceItem:
-        """
-        根据窗口ID（seqName|start:end）构造 SequenceItem（只含该窗口内的帧）。
-        """
-        seq_name, start, end = self._decode_wid(seq_id)
-        if seq_name not in self.base.data_store:
-            raise KeyError(f"[C3VDDatasetV1Adapter] sequence not found: {seq_name}")
-        frames_all = self.base.data_store[seq_name]
+        import numpy as np
+        if seq_id not in self.base.data_store:
+            raise KeyError(f"[C3VDDatasetV1Adapter] sequence not found: {seq_id}")
+
+        frames_all = self.base.data_store[seq_id]
         n = len(frames_all)
 
-        # 真实索引（含窗口内的二次采样与补齐）
-        idxs = self._make_indices(start, end, n)
+        # 分层均匀抽样
+        K = max(1, int(self.k_per_seq))
+        idxs = self._stratified_pick(n, K, jitter=self.jitter, rng=self._rng)
+
+        # 不足是否补齐到 K（用于模型前向需要定长的情况）
+        if self.pad_to_k and len(idxs) < K and n > 0:
+            need = K - len(idxs)
+            if self.pad_mode == "loop":
+                more = []
+                i = 0
+                while len(more) < need:
+                    more.append(idxs[i % len(idxs)])
+                    i += 1
+            else:  # repeat
+                more = [idxs[-1]] * need
+            idxs = idxs + more
 
         frames = [frames_all[i] for i in idxs]
-
         images = [f["color_path"] for f in frames]
         depth_paths   = [f["depth_path"]   for f in frames]
         mask_paths    = [f["occ_path"]     for f in frames]
         normals_paths = [f["normals_path"] for f in frames]
 
-        # data_dir：取第一帧所在目录
         from os.path import dirname
-        data_dir = dirname(images[0]) if images else (self.ROOT and str(Path(self.ROOT, seq_name)))
+        data_dir = dirname(images[0]) if images else (self.ROOT and str(Path(self.ROOT, seq_id)))
 
         gt = {
             "depth_paths": depth_paths,
             "valid_masks": mask_paths,
             "normals_paths": normals_paths,
-            # 如需可额外传：intrinsics / extrinsics
-            # "intrinsics": [f["K"] for f in frames],
-            # "extrinsics_w2c": [f["extri_w2c"] for f in frames],
-            "global_ids": [f["frame_idx"] for f in frames],  # 回拼评估时有用
+            "global_ids": [f["frame_idx"] for f in frames],
         }
         meta = {
-            "sequence_name": seq_name,
-            "sequence_dir": str(Path(self.ROOT, seq_name)) if self.ROOT else None,
+            "sequence_name": seq_id,
+            "sequence_dir": str(Path(self.ROOT, seq_id)) if self.ROOT else None,
             "data_dir": data_dir,
-            "pose_txt": str(Path(self.ROOT, seq_name, "pose.txt")) if self.ROOT else None,
-            "window_range": (int(start), int(end)),
-            "window_length": int(self.L),
+            "pose_txt": str(Path(self.ROOT, seq_id, "pose.txt")) if self.ROOT else None,
+            "sampled_length": len(images),
+            "sampling": {
+                "strategy": "stratified_uniform",
+                "num_samples_per_seq": self.k_per_seq,
+                "jitter": self.jitter,
+                "seed": self.seed,
+                "pad_to_k": self.pad_to_k,
+                "pad_mode": self.pad_mode,
+            },
         }
         return SequenceItem(images=images, gt=gt, meta=meta)
 
     def load_and_preprocess_images(self, image_paths: List[str], device: str) -> torch.Tensor:
-        # 1) 若 base 提供了更合适的预处理，优先用
         if hasattr(self.base, "load_and_preprocess_images") and callable(self.base.load_and_preprocess_images):
             try:
                 return self.base.load_and_preprocess_images(image_paths, device=device)
@@ -428,120 +407,46 @@ class C3VDDatasetV1Adapter:
                 return self.base.load_and_preprocess_images(image_paths).to(device)
             except Exception:
                 pass
-        # 2) VGGT 官方兜底
         try:
             from vggt.utils.load_fn import load_and_preprocess_images as official
             return official(image_paths).to(device)
         except Exception:
             pass
-        # 3) 最终兜底
         return _stack_rgb_as_tensor(image_paths, device=device)
 
     def load_and_preprocess_query_points(self, seq_item, device: str):
         return None
 
-    # ----------------- 内部方法 -----------------
-
-    def _build_windows(self):
-        self._windows.clear()
-        self._seq2len.clear()
-
-        for sn in self._seq_names:
-            frames = self.base.data_store.get(sn, [])
-            n = len(frames)
-            self._seq2len[sn] = n
-            if n <= 0:
-                continue
-
-            if self.slide_stride is not None and self.slide_stride > 0:
-                # —— 滑动窗口 —— 与训练中 shuffle=False、inside_random=False 的稳定行为相似
-                stride = int(self.slide_stride)
-                starts = list(range(0, max(1, n - self.L + 1), stride))
-                for s in starts:
-                    e = s + self.L
-                    if e <= n:
-                        self._windows.append((sn, s, e))
-                # 尾窗（右对齐）：确保覆盖到序列末尾
-                if not self.drop_last and (n < self.L or (n - self.L) % stride != 0):
-                    s = max(0, n - self.L)
-                    e = s + self.L
-                    if (sn, s, e) not in self._windows:
-                        self._windows.append((sn, s, e))
-            else:
-                # —— 随机选择一个窗口（推理通常每序列一个就够）——
-                if n >= self.L:
-                    if self.inside_random:
-                        s = int(self._rng.randint(0, n - self.L + 1))
-                    else:
-                        s = 0
-                    e = s + self.L
-                    self._windows.append((sn, s, e))
-                else:
-                    # 过短也给一个窗口（0, n），后续 _make_indices 里再补齐到 L
-                    self._windows.append((sn, 0, n))
-
-        # 可选：限制每条序列的窗口数量
-        limit_per_seq = int(self.ds_cfg.get("limit_windows_per_seq", -1))
-        if limit_per_seq > 0 and self.slide_stride is not None:
-            filtered = []
-            seen = {}
-            for sn, s, e in self._windows:
-                cnt = seen.get(sn, 0)
-                if cnt < limit_per_seq:
-                    filtered.append((sn, s, e))
-                    seen[sn] = cnt + 1
-            self._windows = filtered
-
-    def _make_indices(self, start: int, end: int, n: int) -> List[int]:
-        """
-        从 [start, end) 生成长度为 L 的帧索引：
-         - 若 end-start >= L：
-              inside_random=True  ⇒ 在窗口内随机选 L 帧并排序
-              inside_random=False ⇒ 直接取 start..start+L-1
-         - 若不足 L：按 allow_duplicate_img 规则补齐
-        """
-        start = int(start); end = int(end)
-        length = max(0, min(end, n) - max(0, start))
-
-        if length >= self.L:
-            if self.inside_random:
-                chosen = sorted(self._rng.choice(np.arange(start, start + length), size=self.L, replace=False))
-                return [int(i) for i in chosen]
-            else:
-                return list(range(start, start + self.L))
-
-        # 不足 L：补齐
-        base_idxs = list(range(start, start + length))
-        if length <= 0:
-            # 极端情况：序列空或窗口越界，退化为重复最后一帧 0
-            fill_val = min(max(n - 1, 0), n - 1) if n > 0 else 0
-            return [fill_val] * self.L
-
-        if self.allow_duplicate_img:
-            # 重复最后一帧到 L
-            pad = [base_idxs[-1]] * (self.L - length)
-            return base_idxs + pad
-        else:
-            # 循环补齐
-            idxs = []
-            while len(idxs) < self.L:
-                take = min(length, self.L - len(idxs))
-                idxs.extend(base_idxs[:take])
-            return idxs
-
+    # ---------- 内部 ----------
     @staticmethod
-    def _encode_wid(seq_name: str, start: int, end: int) -> str:
-        return f"{seq_name}|{int(start)}:{int(end)}"
+    def _stratified_pick(n: int, k: int, jitter: bool, rng) -> List[int]:
+        import numpy as np
+        if n <= 0:
+            return []
+        if k >= n:
+            return list(range(n))  # 不够就全取
+        edges = np.linspace(0, n, num=k+1, endpoint=True, dtype=float)
+        idxs = []
+        for i in range(k):
+            a, b = edges[i], edges[i+1]
+            if jitter:
+                x = rng.uniform(a, max(a, b - 1e-6))
+                j = int(np.clip(np.floor(x), 0, n-1))
+            else:
+                x = (a + b) * 0.5
+                j = int(np.clip(int(round(x - 0.5)), 0, n-1))
+            idxs.append(j)
+        idxs = sorted(set(idxs))
+        while len(idxs) < min(k, n):
+            gaps = [idxs[i+1]-idxs[i] for i in range(len(idxs)-1)]
+            if not gaps:
+                break
+            pos = int(np.argmax(gaps))
+            cand = (idxs[pos] + idxs[pos+1]) // 2
+            if cand not in idxs:
+                idxs.insert(pos+1, int(cand))
+            else:
+                break
+        return idxs[:min(k, n)]
 
-    @staticmethod
-    def _decode_wid(seq_id: str) -> tuple[str, int, int]:
-        # 兼容纯序列名（无窗口参数）的旧用法：退化为整段
-        if "|" not in seq_id:
-            name = seq_id
-            start, end = 0, 1 << 30
-            return name, start, end
-        name, rng = seq_id.split("|", 1)
-        s, e = rng.split(":")
-        return name, int(s), int(e)
-    
     

@@ -4,7 +4,7 @@ mode: inference          # inference | finetune | lora
 # ======= runtime ========
 output_dir: outputs/vggt_eval
 inference:
-  ddp: true                # ← 开启 DDP 推理（用 torchrun 启动） torchrun --nproc_per_node=4 infer.py -c path/to/your.yaml
+  ddp: false               # ← 开启 DDP 推理（用 torchrun 启动） torchrun --nproc_per_node=4 infer.py -c path/to/your.yaml
   ddp_backend: nccl         # 单机多卡常用 nccl
   ddp_timeout_mins: 60
   max_img_per_gpu: 32       # ← 可选：推理阶段也显式限制“每步送入的帧数上限”
@@ -19,19 +19,26 @@ amp:
 # ======= model ==========
 model:
   pretrained_id: facebook/VGGT-1B   # 先拉骨干（结构/默认权重）
-  resume: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/exp001/ckpts/checkpoint.pt    # 可为 .pth/.pt/.safetensors 或包含权重的目录
+  resume: null    # 可为 .pth/.pt/.safetensors 或包含权重的目录
   strict: false                     # 头不一致时建议 false
 
 # ======= dataset ========
 dataset:
   name: c3vd_v1
-  root: /data/C3VD/C3VDv1/registered
+  root: /home/re_lyz/python/vggt_data/C3VD/registered
   config_file: custom_dataset.yaml   # ← 二级 YAML 文件名，放在主 YAML 同目录
   use_registered: true
   min_num_images: 2
   assume_pose: w2c            # 可选：你的 pose.txt 是 w2c 还是 c2w
   depth_unit_scale: 0.001     # 可选：比如毫米→米就 0.001
   limit_seqs: -1
+
+  stratified_eval:
+    num_samples_per_seq: 32   # K；每条序列抽多少张
+    jitter: false             # true=每个分层桶内随机抖动
+    seed: 0                   # 抖动随机种子
+    pad_to_k: false           # 若某序列不足K，是否补齐到K
+    pad_mode: repeat          # repeat / loop（当 pad_to_k=true 生效）
 
 # ======= evaluation =====
 evaluation:

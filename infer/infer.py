@@ -265,6 +265,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
             if rank == 0:
                 merged_preds = merge_preds_chunks(gathered)  # dict: 每个键维度0拼成 T
                 print(merged_preds.keys())
+
                 merged_preds_np = tree_to_numpy(merged_preds)
                 # === 位姿评估（保持你的原逻辑）===
                 cam_cfg = cfg.get("evaluation", {}).get("camera", {})
