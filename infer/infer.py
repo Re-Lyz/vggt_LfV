@@ -264,7 +264,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
             # === rank0：按时间维拼回整条序列的预测，并评估/落盘 ===
             if rank == 0:
                 merged_preds = merge_preds_chunks(gathered)  # dict: 每个键维度0拼成 T
-                print(merged_preds.keys())
+                # print(merged_preds.keys())
 
                 merged_preds_np = tree_to_numpy(merged_preds)
                 # === 位姿评估（保持你的原逻辑）===
@@ -320,47 +320,76 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
         except Exception as e:
             print(f"[WARN][rank {rank}] sequence {seq_id} failed: {e}")
 
-    # ===== 跨 rank 汇总到 rank0（接口保留；非 rank0 此时基本无结果）=====
-    if use_ddp and world_size > 1:
-        gather_list = [None for _ in range(world_size)] if rank == 0 else None
-        dist.gather_object(
-            obj=dict(depth=all_seq_depth_metrics, pose=pose_collect),
-            gather_list=gather_list,
-            dst=0,
-        )
+    if use_ddp and world_size > 1 and dist.is_available() and dist.is_initialized():
+        # 先把要传输的对象“净化”为纯可序列化结构
+        local_obj = {
+            "depth": _to_plain(all_seq_depth_metrics),
+            "pose":  _to_plain(pose_collect),
+        }
+    
         if rank == 0:
+            object_gather_list = [None] * world_size
+            dist.gather_object(
+                obj=local_obj,
+                object_gather_list=object_gather_list,
+                dst=0,
+            )
+    
+            # 在 rank0 合并
             merged_depth = []
-            merged_pose = defaultdict(lambda: {"APE": defaultdict(list), "RPE": defaultdict(list)})
-            for it in gather_list:
-                if it is None:
+            # 用顶层函数作为 default_factory（可 picklable），避免 lambda
+            def dd3(): return defaultdict(list)        # [key] -> list
+            def dd2(): return defaultdict(dd3)         # [metric_name] -> dd3
+            def dd1(): return defaultdict(dd2)         # [mode] -> dd2
+            merged_pose = dd1()
+    
+            for it in object_gather_list:
+                if not it:
                     continue
-                merged_depth.extend(it["depth"])
-                for mode, groups in it["pose"].items():
+                
+                # depth: 直接拼接
+                merged_depth.extend(it.get("depth", []))
+    
+                # pose: 期望结构 {mode: {metric_name: {k: [vals]}}}
+                for mode, groups in it.get("pose", {}).items():
                     for mname, stats in groups.items():
                         for k, arr in stats.items():
+                            if arr is None:
+                                continue
+                            # arr 现在是 list（我们已经 _to_plain 过了）
                             merged_pose[mode][mname][k].extend(arr)
+    
+            # 覆盖为聚合结果
             all_seq_depth_metrics = merged_depth
             pose_collect = merged_pose
-
+        else:
+            # 非 dst 仅发送对象
+            dist.gather_object(obj=local_obj, dst=0)
+    
+        # 若后续还有协作逻辑，做一次同步
+        dist.barrier()
+    
     # ===== 只有 rank0 写最终汇总（保持你的原逻辑）=====
     if rank == 0:
         summary = {}
         if all_seq_depth_metrics:
             summary["depth_overall_mean"] = aggregate_depth_metrics(all_seq_depth_metrics)
-
+    
         pose_overall = {}
+        # pose_collect: {mode: {metric_name: {k: [vals]}}}
         for mode, groups in pose_collect.items():
             pose_overall[mode] = {}
             for mname, stats_dict in groups.items():
-                vals = {k: float(sum(v) / len(v)) for k, v in stats_dict.items() if len(v) > 0}
+                vals = {k: float(sum(v) / max(len(v), 1)) for k, v in stats_dict.items() if len(v) > 0}
                 if vals:
-                    pose_overall[mname] = vals
+                    pose_overall[mode][mname] = vals
         if pose_overall:
             summary["camera_overall_mean"] = pose_overall
-
+    
         dump_json({"summary": summary, "num_sequences": len(loader.list_sequences())}, out_root / "summary.json")
         print("[rank0] Inference done. Summary:", json.dumps(summary, indent=2, ensure_ascii=False))
-
+    
+    # ===== DDP 清理（若存在）=====
     if dist_is_ready():
         cleanup_ddp()
 
@@ -379,6 +408,36 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
     
 #     print(data1["frame_num"])
 #     print(data2["frame_num"])
+
+def _to_plain(obj):
+    """递归把对象转成可通过 gather_object 传输的纯类型（dict/list/num/str）。"""
+    # defaultdict -> dict（去掉 default_factory）
+    if isinstance(obj, defaultdict):
+        obj = dict(obj)
+
+    # dict 递归
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+
+    # list / tuple 递归（tuple 也转 list，避免后面有自定义 tuple 子类）
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(v) for v in obj]
+
+    # torch.Tensor / np.ndarray -> list
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    # 其他基础类型直接返回；不可序列化的兜底成 str
+    try:
+        json.dumps(obj)
+        return obj
+    except Exception:
+        return str(obj)
+
+
+
 
 # -----------------------
 # 入口
