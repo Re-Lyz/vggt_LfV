@@ -1,4 +1,5 @@
 infer/outputs
+training/outputs
 training/logs
 
 .gradio/

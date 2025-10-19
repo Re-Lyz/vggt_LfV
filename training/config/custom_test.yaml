@@ -14,7 +14,7 @@ max_img_per_gpu: 48
 pretrained_vggt: True   # If True, load the pretrained weights on ImageNet22K
 
 limit_train_batches: 800
-limit_val_batches: 400
+limit_val_batches: 20
 
 
 data:

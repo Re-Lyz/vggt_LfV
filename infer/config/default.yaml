@@ -19,7 +19,7 @@ amp:
 # ======= model ==========
 model:
   pretrained_id: facebook/VGGT-1B   # 先拉骨干（结构/默认权重）
-  resume: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/exp001/ckpts/checkpoint.pt    # 可为 .pth/.pt/.safetensors 或包含权重的目录
+  resume: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/exp002/ckpts/checkpoint.pt    # 可为 .pth/.pt/.safetensors 或包含权重的目录
   strict: false                     # 头不一致时建议 false
 
 # ======= dataset ========

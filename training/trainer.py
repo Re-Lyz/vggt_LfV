@@ -43,6 +43,12 @@ from train_utils.normalization import normalize_camera_extrinsics_and_points_bat
 from train_utils.optimizer import construct_optimizers
 
 
+class _NullTBWriter:
+    def log(self, *args, **kwargs): 
+        pass
+    def log_visuals(self, *args, **kwargs): 
+        pass
+
 class Trainer:
     """
     A generic trainer for DDP training. This should naturally support multi-node training.
@@ -78,6 +84,7 @@ class Trainer:
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
         pretrained: Optional[Dict[str, Any]] = None,
+        test: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         """
@@ -113,6 +120,7 @@ class Trainer:
         self.checkpoint_conf = checkpoint
         self.optim_conf = optim
         self.pretrained_conf = pretrained
+        self.test_conf = test
 
         # Store hyperparameters
         self.accum_steps = accum_steps
@@ -131,15 +139,17 @@ class Trainer:
         self._setup_torch_dist_and_backend(cuda, distributed)
 
         # Setup logging directory and configure logger
-        safe_makedirs(self.logging_conf.log_dir)
-        setup_logging(
-            __name__,
-            output_dir=self.logging_conf.log_dir,
-            rank=self.rank,
-            log_level_primary=self.logging_conf.log_level_primary,
-            log_level_secondary=self.logging_conf.log_level_secondary,
-            all_ranks=self.logging_conf.all_ranks,
-        )
+        if self.mode in ["train", "val"]:
+            safe_makedirs(self.logging_conf.log_dir)
+            setup_logging(
+                __name__,
+                output_dir=self.logging_conf.log_dir,
+                rank=self.rank,
+                log_level_primary=self.logging_conf.log_level_primary,
+                log_level_secondary=self.logging_conf.log_level_secondary,
+                all_ranks=self.logging_conf.all_ranks,
+            )
+
         set_seeds(seed_value, self.max_epochs, self.distributed_rank)
 
         assert is_dist_avail_and_initialized(), "Torch distributed needs to be initialized before calling the trainer."
@@ -153,17 +163,18 @@ class Trainer:
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.4f")
 
         # Construct optimizers (after moving model to device)
-        if self.mode != "val":
+        if self.mode == "train":
             self.optims = construct_optimizers(self.model, self.optim_conf)
         self._report_model_and_optim_memory(where="post_optim_init")
         
         # Load checkpoint if available or specified
-        if self.checkpoint_conf.resume_checkpoint_path is not None:
-            self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
-        else:   
-            ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
-            if ckpt_path is not None:
-                self._load_resuming_checkpoint(ckpt_path)
+        self._maybe_load_checkpoint_or_weights()
+        # if self.checkpoint_conf.resume_checkpoint_path is not None:
+        #     self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
+        # else:   
+        #     ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
+        #     if ckpt_path is not None:
+        #         self._load_resuming_checkpoint(ckpt_path)
 
         # Wrap the model with DDP
         self._setup_ddp_distributed_training(distributed, device)
@@ -215,7 +226,7 @@ class Trainer:
             logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
 
         # Load optimizer state if available and in training mode
-        if "optimizer" in checkpoint:
+        if "optimizer" in checkpoint and self.mode != "val":
             logging.info(f"Loading optimizer state dict (rank {self.rank})")
             self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
 
@@ -247,16 +258,25 @@ class Trainer:
         self.steps = {'train': 0, 'val': 0}
 
         # Instantiate components from configs
-        self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
+        if self.mode in ["train", "val"]:
+            self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
+        else:
+            self.tb_writer = _NullTBWriter()
+                    
         self.model = instantiate(self.model_conf, _recursive_=False)
         self._maybe_load_vggt_pretrained()
         # print("=== TOP-LEVEL CHILDREN ===")
         # summary_named_children(self.model, depth=2)
         # print("=== SAMPLE PARAM NAMES ===")
         # peek_param_names(self.model, k=40)
-        self.loss = instantiate(self.loss_conf, _recursive_=False)
-        self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
+        if self.mode in ["train", "val"]:
+            self.loss = instantiate(self.loss_conf, _recursive_=False)
+            self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
+        else:
+            self.loss = None
+            self.gradient_clipper = None
+            self.scaler = torch.cuda.amp.GradScaler(enabled=False)
         
         # Freeze specified model parameters if any
         if getattr(self.optim_conf, "frozen_module_names", None):
@@ -272,7 +292,7 @@ class Trainer:
             )
 
         # Log model summary on rank 0
-        if self.rank == 0:
+        if self.rank == 0 and self.mode in ["train", "val"]:
             model_summary_path = os.path.join(self.logging_conf.log_dir, "model.txt")
             model_summary(self.model, log_file=model_summary_path)
             logging.info(f"Model summary saved to {model_summary_path}")
@@ -284,17 +304,33 @@ class Trainer:
         self.train_dataset = None
         self.val_dataset = None
 
-        if self.mode in ["train", "val"]:
-            self.val_dataset = instantiate(
-                self.data_conf.get('val', None), _recursive_=False
-            )
-            if self.val_dataset is not None:
+        if self.mode == "val":
+            ds_conf = self.data_conf.get("val", None)
+            if ds_conf is not None:
+                self.val_dataset = instantiate(ds_conf, _recursive_=False)
                 self.val_dataset.seed = self.seed_value
+            return
+
+        # --- TEST 模式（纯推理/评估）---
+        if self.mode == "test":
+            ds_conf = self.data_conf.get("test", None)
+            if ds_conf is None:
+                ds_conf = self.data_conf.get("val", None)
+                if ds_conf is not None and self.rank == 0:
+                    logging.info("[test] data.test 未配置，使用 data.val 作为测试数据集")
+            if ds_conf is not None:
+                self.val_dataset = instantiate(ds_conf, _recursive_=False)
+                self.val_dataset.seed = self.seed_value
+            return
 
         if self.mode in ["train"]:
             self.train_dataset = instantiate(self.data_conf.train, _recursive_=False)
             self.train_dataset.seed = self.seed_value
-
+            return
+        
+        logging.warning(f"Unknown mode {self.mode}; no datasets initialized.")
+            
+        
     def _setup_ddp_distributed_training(self, distributed_conf: Dict, device: str):
         """Wraps the model with DistributedDataParallel (DDP)."""
         assert isinstance(self.model, torch.nn.Module)
@@ -349,6 +385,37 @@ class Trainer:
     
         # 同步，确保其它 rank 在缓存可用后再继续
         dist.barrier()
+
+    def _maybe_load_checkpoint_or_weights(self):
+        """
+        加载权重的优先级：
+        (1) 若 test 模式且 cfg.test.weights 指定，则加载该权重
+        (2) 否则若 checkpoint.resume_checkpoint_path 指定，则加载
+        (3) 否则尝试自动 resume（save_dir 下最新）
+        训练模式还会加载 optimizer/scaler；test 模式仅加载 model 权重
+        """
+        # test 模式：允许从 test.weights 指定文件加载
+        test_conf = getattr(self, "test_conf", None)
+        if self.mode == "test" and test_conf and test_conf.get("weights", None):
+            ckpt_path = test_conf.get("weights")
+            logging.info(f"[test] Loading weights from {ckpt_path} (rank {self.rank})")
+            with g_pathmgr.open(ckpt_path, "rb") as f:
+                checkpoint = torch.load(f, map_location="cpu")
+            model_state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+            missing, unexpected = self.model.load_state_dict(model_state_dict, strict=self.checkpoint_conf.strict)
+            if self.rank == 0:
+                logging.info(f"[test] Weights loaded. Missing: {missing or 'None'}, Unexpected: {unexpected or 'None'}.")
+            return
+    
+        # 非 test 或 test 未指定 weights，按原逻辑
+        if self.checkpoint_conf.resume_checkpoint_path is not None:
+            self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
+            return
+    
+        ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
+        if ckpt_path is not None:
+            self._load_resuming_checkpoint(ckpt_path)
+
 
 
     def save_checkpoint(self, epoch: int, checkpoint_names: Optional[List[str]] = None):

@@ -290,6 +290,7 @@ def run_inference(cfg, device: str, amp_dtype: torch.dtype, amp_enabled: bool, a
                 depth_cfg = cfg.get("evaluation", {}).get("depth", {"enabled": True})
                 if depth_cfg.get("enabled", True):
                     depth_cfg_eff = dict(depth_cfg)
+                    
                     depth_metrics = evaluate_sequence_depth(
                         preds=merged_preds_np,
                         gt_paths=seq_item.gt.get("depth_paths", []),

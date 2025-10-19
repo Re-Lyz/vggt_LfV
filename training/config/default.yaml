@@ -1,6 +1,8 @@
 defaults:
   - default_dataset.yaml
-
+  - _self_
+  - eval: default
+  
 exp_name: exp001
 img_size: 518
 num_workers: 8

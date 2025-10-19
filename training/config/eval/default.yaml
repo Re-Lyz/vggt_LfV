@@ -1,0 +1,23 @@
+# config/eval/default.yaml
+# 专门给 run_val_dump_and_eval_external 使用的评估配置
+
+# 输出目录；可引用主配置里的 exp_name（若主 cfg 里有该字段）
+out_dir: outputs/eval/${exp_name}
+
+# 写到 epoch-<epoch_tag>/... 里
+epoch_tag: latest
+
+# 相机评估配置（evo）
+camera:
+  align: [sim3, se3, none]     # 同时评估多种对齐
+  quat_order: xyzw             # 你的编码为 [T, quat(xyzw), ...]；若是 wxyz 改这里
+  plot_align_mode: sim3        # 仅用于可视化，不影响数值指标
+  plot_3d: true
+  rpe_delta: 1
+  rpe_delta_unit: frames       # 或 seconds
+
+# 深度评估配置
+depth:
+  align: median                # 可选：lsq / mean / none
+  min_depth: 0.001
+  max_depth: 80.0
