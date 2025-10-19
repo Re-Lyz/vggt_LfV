@@ -66,7 +66,7 @@ data:
     # Shuffling in PyTorch DataLoader can sometimes copy large dicts and exceed CPU memory
     # (see: https://github.com/pytorch/pytorch/issues/13246).
     # To avoid this, set shuffle=False and enable common_config.inside_random=True instead.
-    shuffle: True
+    shuffle: False
     pin_memory: False
     common_config:  # common config for evaluation
       fix_img_num: -1 # -1 means do not fix the number of images
@@ -83,8 +83,8 @@ data:
       debug: False
       get_nearby: True
       load_depth: True
-      img_nums: [2, 12]
-      allow_duplicate_img: True
+      img_nums: [20, 20]
+      allow_duplicate_img: False
 
       ocam:
         calib_width: 1350

@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms
 # Standalone validation inference + evaluation runner (no changes to Trainer).
+# torchrun --standalone --nproc_per_node=2 infer_eval.py --config custom_test
 
 # ========== 标准库 ==========
 import argparse
@@ -23,6 +24,7 @@ from eval.evo_pose import evaluate_and_visualize_poses as eval_poses
 from trainer import Trainer
 from train_utils.general import copy_data_to_device
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding
+from infer_utils import sort_batch_by_ids, merge_camera_results, save_batch_images
 
 @torch.no_grad()
 def run_val_dump_and_eval_external(
@@ -66,6 +68,9 @@ def run_val_dump_and_eval_external(
     assert val_ds is not None, "val_dataset 未初始化；请确认 data.val 已配置并在 Trainer.__init__ 中被实例化"
     val_loader = val_ds.get_loader(epoch=int(trainer.epoch + trainer.distributed_rank))
 
+    # print(f"[rank {rank}] loader.batch_size = {getattr(val_loader, 'batch_size', None)}")
+    # print(f"[rank {rank}] drop_last = {getattr(val_loader, 'drop_last', None)}")
+
     # AMP
     amp_enabled = bool(trainer.optim_conf.amp.enabled)
     amp_type = trainer.optim_conf.amp.amp_dtype
@@ -82,7 +87,7 @@ def run_val_dump_and_eval_external(
             with torch.cuda.amp.autocast(enabled=False):
                 batch = trainer._process_batch(batch)
             batch = copy_data_to_device(batch, device, non_blocking=True)
-
+            batch = sort_batch_by_ids(batch)
             # 前向
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
                 preds = model(images=batch["images"])
@@ -161,6 +166,12 @@ def run_val_dump_and_eval_external(
             (batch_out_dir / "camera").mkdir(parents=True, exist_ok=True)
             (batch_out_dir / "depth").mkdir(parents=True, exist_ok=True)
 
+            # === 保存本批使用的输入图像 ===
+            try:
+                save_batch_images(batch, batch_out_dir, rank)
+            except Exception as ex:
+                print(f"[rank {rank}] save images failed at batch {data_iter}: {ex}")
+
             cam_metrics = eval_poses(
                 pred_pose_enc_valid=pred_pose_enc_valid,
                 gt_pose_enc_valid=gt_pose_enc_valid,
@@ -186,39 +197,7 @@ def run_val_dump_and_eval_external(
     # ========= 汇总 Summary（跨 batch）=========
     summary = {}
 
-    def _merge_camera_results(all_res: list[dict]) -> dict:
-        if not all_res:
-            return {}
-        modes = {}
-        for res in all_res:
-            for mode, block in res.items():
-                m = modes.setdefault(mode, {"APE": [], "RPE": []})
-                if "APE" in block and block["APE"]:
-                    m["APE"].append(block["APE"])
-                if "RPE" in block and block["RPE"]:
-                    m["RPE"].append(block["RPE"])
-        merged = {}
-        for mode, parts in modes.items():
-            merged[mode] = {}
-            for key in ("APE", "RPE"):
-                if not parts[key]:
-                    merged[mode][key] = {}
-                    continue
-                keys = set().union(*[d.keys() for d in parts[key]])
-                agg = {}
-                for k in keys:
-                    vals = []
-                    for d in parts[key]:
-                        v = d.get(k, np.nan)
-                        try:
-                            vals.append(float(v))
-                        except Exception:
-                            vals.append(np.nan)
-                    agg[k] = float(np.nanmean(vals))
-                merged[mode][key] = agg
-        return merged
-
-    cam_summary = _merge_camera_results(per_batch_camera)
+    cam_summary = merge_camera_results(per_batch_camera)
     if cam_summary:
         summary["camera"] = cam_summary
 
