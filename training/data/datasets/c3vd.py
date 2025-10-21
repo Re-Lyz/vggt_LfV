@@ -38,7 +38,7 @@ class C3VDDatasetv1(BaseDataset):
         assume_pose: str = "w2c",
 
         # 深度单位（如毫米→米）
-        depth_unit_scale: float = 1.0,
+        depth_unit_scale: float = 100.0/65535.0,
     ):
         super().__init__(common_conf=common_conf)
         # 行为开关（与管线对齐）
@@ -205,7 +205,7 @@ class C3VDDatasetv1(BaseDataset):
                 depth_map = threshold_depth_map(depth_map, max_percentile=98, min_percentile=-1)
             else:
                 depth_map = None
-
+                
             original_size = np.array(image.shape[:2])
 
             # 3) 位姿/内参（OpenCV 约定；外参为 w->c 3x4）

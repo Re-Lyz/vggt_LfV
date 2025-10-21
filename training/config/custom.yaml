@@ -3,7 +3,7 @@ defaults:
   - _self_
   - eval: default
 
-exp_name: exp002
+exp_name: exp003
 img_size: 266
 num_workers: 8
 seed_value: 42
@@ -13,8 +13,8 @@ val_epoch_freq: 5
 max_img_per_gpu: 48
 pretrained_vggt: True   # If True, load the pretrained weights on ImageNet22K
 
-limit_train_batches: 8
-limit_val_batches: 4
+limit_train_batches: 80
+limit_val_batches: 10
 
 
 data:
@@ -168,7 +168,7 @@ optim:
           value: 0.05
 
   finetune:
-    enable: true
+    enable: false
     # 两种模式："lora"（PEFT-LoRA 只打注意力） / "full"（注意力全量）
     mode: "lora"
 

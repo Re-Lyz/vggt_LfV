@@ -139,8 +139,11 @@ def run_val_dump_and_eval_external(
                 pred_depth = pred_depth.unsqueeze(1)
             elif pred_depth.ndim != 4:
                 raise RuntimeError(f"不支持的 depth 形状：{pred_depth.shape}")
+            np.set_printoptions(threshold=np.inf, linewidth=np.inf)
+            # print(" pred_depth ", pred_depth)
 
             gt_depth = batch.get("depths", None)
+            # print(" gt_depth ", gt_depth)
             if gt_depth is not None:
                 if gt_depth.ndim == 5 and gt_depth.shape[-1] == 1:
                     gt_depth = gt_depth.squeeze(-1)
