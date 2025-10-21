@@ -31,7 +31,7 @@ class C3VDDatasetv1(BaseDataset):
         cameras=("cam0",),
         USE_REGISTERED: bool = True,
         min_num_images: int = 2,
-        len_train: int = 100000,
+        len_train: int = 1000,
         len_test: int = 20,
 
         # 位姿方向：pose.txt 若是 c2w，则 assume_pose='c2w'；w2c 则 'w2c'

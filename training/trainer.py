@@ -41,7 +41,7 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
-
+from train_utils.lora import apply_finetune_strategy
 
 class _NullTBWriter:
     def log(self, *args, **kwargs): 
@@ -217,6 +217,8 @@ class Trainer:
         with g_pathmgr.open(ckpt_path, "rb") as f:
             checkpoint = torch.load(f, map_location="cpu")
         
+        print(f"Checkpoint keys: {list(checkpoint.keys())}")
+        # print("checkpoint optimizer:", checkpoint.get("optimizer", None))
         # Load model state
         model_state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
         missing, unexpected = self.model.load_state_dict(
@@ -228,7 +230,7 @@ class Trainer:
         # Load optimizer state if available and in training mode
         if "optimizer" in checkpoint and self.mode != "val":
             logging.info(f"Loading optimizer state dict (rank {self.rank})")
-            self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
+            self.optims[0].optimizer.load_state_dict(checkpoint["optimizer"])
 
         # Load training progress
         if "epoch" in checkpoint:
@@ -290,6 +292,11 @@ class Trainer:
             logging.info(
                 f"[Done] Freezing modules: {self.optim_conf.frozen_module_names} on rank {self.distributed_rank}"
             )
+            
+        self.model = apply_finetune_strategy(
+                self.model,
+                getattr(self.optim_conf, "finetune", None),
+            )            
 
         # Log model summary on rank 0
         if self.rank == 0 and self.mode in ["train", "val"]:
