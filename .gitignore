@@ -1,6 +1,7 @@
 infer/outputs
 training/outputs
 training/logs
+training/debugging_outputs
 
 .gradio/
 .hydra/

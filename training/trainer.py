@@ -276,7 +276,7 @@ class Trainer:
             self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
         else:
-            self.loss = None
+            self.loss = instantiate(self.loss_conf, _recursive_=False)
             self.gradient_clipper = None
             self.scaler = torch.cuda.amp.GradScaler(enabled=False)
         
@@ -333,6 +333,10 @@ class Trainer:
         if self.mode in ["train"]:
             self.train_dataset = instantiate(self.data_conf.train, _recursive_=False)
             self.train_dataset.seed = self.seed_value
+            ds_conf = self.data_conf.get("val", None)
+            if ds_conf is not None:
+                self.val_dataset = instantiate(ds_conf, _recursive_=False)
+                self.val_dataset.seed = self.seed_value
             return
         
         logging.warning(f"Unknown mode {self.mode}; no datasets initialized.")

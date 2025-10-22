@@ -23,7 +23,7 @@ def main():
     with initialize(version_base=None, config_path="config"):
         cfg = compose(config_name=args.config)
 
-    trainer = Trainer(**cfg)
+    trainer = Trainer(**cfg )
     trainer.run()
 
 

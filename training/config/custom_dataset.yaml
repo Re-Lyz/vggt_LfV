@@ -83,7 +83,7 @@ data:
       debug: False
       get_nearby: True
       load_depth: True
-      img_nums: [20, 20]
+      img_nums: [15, 15]
       allow_duplicate_img: False
 
       ocam:

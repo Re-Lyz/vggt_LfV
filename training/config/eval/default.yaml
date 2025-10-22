@@ -20,4 +20,4 @@ camera:
 depth:
   align: median                # 可选：lsq / mean / none
   min_depth: 0.001
-  max_depth: 80.0
+  max_depth: 100.0

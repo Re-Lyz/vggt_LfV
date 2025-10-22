@@ -426,7 +426,17 @@ def save_batch_images(batch, out_dir: Path, rank: int):
                     from PIL import Image
                     Image.fromarray(x.permute(1,2,0).numpy()).save(img_dir / fn)
         
-        
+
+
+def to_serializable(obj):
+    """把 tensor/列表 等递归转成可 JSON 序列化的 Python 原生类型"""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, (list, tuple)):
+        return [to_serializable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: to_serializable(v) for k, v in obj.items()}
+    return obj
         
         
         

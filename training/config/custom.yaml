@@ -26,7 +26,7 @@ data:
     common_config:
       img_size: ${img_size}
       patch_size: ${patch_size}
-      debug: False
+      debug: True
       repeat_batch: False
     dataset:
       _target_: data.composed_dataset.ComposedDataset
@@ -196,7 +196,7 @@ optim:
 
 
 
-max_epochs: 5
+max_epochs: 20
 
 model:
   _target_: vggt.models.vggt.VGGT
@@ -224,4 +224,4 @@ cuda:
 
 # test 专用配置
 test:
-  weights: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/exp001/ckpts/checkpoint.pt    # 例如: /path/to/checkpoint_latest.pt
+  weights: null    # 例如: /path/to/checkpoint_latest.pt

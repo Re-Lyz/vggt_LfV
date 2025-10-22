@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+import os
+import cv2
 from hydra import compose, initialize
 from omegaconf import OmegaConf
 
@@ -24,7 +26,7 @@ from eval.evo_pose import evaluate_and_visualize_poses as eval_poses
 from trainer import Trainer
 from train_utils.general import copy_data_to_device
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding
-from infer_utils import sort_batch_by_ids, merge_camera_results, save_batch_images
+from infer_utils import sort_batch_by_ids, merge_camera_results, save_batch_images, to_serializable
 
 @torch.no_grad()
 def run_val_dump_and_eval_external(
@@ -91,6 +93,7 @@ def run_val_dump_and_eval_external(
             # 前向
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
                 preds = model(images=batch["images"])
+                
 
             # ========= Pose（编码 & 筛帧）=========
             if "pose_enc_list" not in preds:
@@ -168,6 +171,18 @@ def run_val_dump_and_eval_external(
             batch_out_dir = out_root / f"batch_{data_iter:06d}"
             (batch_out_dir / "camera").mkdir(parents=True, exist_ok=True)
             (batch_out_dir / "depth").mkdir(parents=True, exist_ok=True)
+            
+            keys = ["depth", "depth_conf", "pose_enc"]
+            data = {k: to_serializable(preds[k]) for k in keys if k in preds}
+            pred_out_dir = Path(batch_out_dir)
+            pred_out_dir.mkdir(parents=True, exist_ok=True)
+            with open(pred_out_dir / "predictions.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            
+            depth = pred_depth
+            check_depth(depth, batch_out_dir)
+
 
             # === 保存本批使用的输入图像 ===
             try:
@@ -291,6 +306,68 @@ def main():
         depth_cfg=depth_cfg,
     )
 
+
+def save_image_and_depth(image, depth_map, image_name, depth_name):
+    """
+    将图像和深度图保存到当前目录中。
+
+    Args:
+        image: 图像数据，通常是 BGR 或 RGB 格式。
+        depth_map: 深度图数据。
+        image_name: 保存图像的文件名。
+        depth_name: 保存深度图的文件名。
+    """
+    # 保存图像
+    path = os.getcwd()
+    save_path = os.path.join(path, "debugging_outputs")
+    os.makedirs(save_path, exist_ok=True)
+    if image is not None:
+        image_path = os.path.join(save_path, image_name)
+        cv2.imwrite(image_path, image)
+        print(f"Saved image to {image_path}")
+
+    # 保存深度图
+    if depth_map is not None:
+        depth_path = os.path.join(save_path, depth_name)
+        # 深度图通常是浮点类型，将其转换为适当的显示格式
+        depth_map = np.uint16(depth_map * 65535 * 10)  # 将深度图范围映射到 16 位
+        cv2.imwrite(depth_path, depth_map)
+        print(f"Saved depth map to {depth_path}")
+        
+def check_depth(depth: torch.Tensor, batch_out_dir: Path):
+        batch_out_dir = batch_out_dir / "debug_depth"
+        depth = depth.detach().cpu().squeeze()
+        
+        depth = torch.nan_to_num(depth, nan=0.0, posinf=100, neginf=0.0)
+        import imageio.v2 as imageio
+        
+        def m_to_raw_u16(d: torch.Tensor) -> torch.Tensor:
+            raw = torch.round(d * 65535.0)
+            raw = torch.clamp(raw, 0, 65535)
+            return raw.to(torch.uint16)
+
+        def save_u16_png(arr_u16: np.ndarray, out_path: Path):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            imageio.imwrite(out_path.as_posix(), arr_u16)
+
+        if depth.ndim == 2:
+            raw_u16 = m_to_raw_u16(depth)                     # (H, W)
+            save_u16_png(raw_u16.numpy(), batch_out_dir / f"depth.png")
+
+        elif depth.ndim == 3:
+            B = depth.shape[0]
+            for b in range(B):
+                raw_u16 = m_to_raw_u16(depth[b])              # (H, W)
+                save_u16_png(raw_u16.numpy(), batch_out_dir / f"depth_b{b:03d}.png")
+
+        elif depth.ndim == 4:
+            B, T = depth.shape[:2]
+            for b in range(B):
+                for t in range(T):
+                    raw_u16 = m_to_raw_u16(depth[b, t])       # (H, W)
+                    save_u16_png(raw_u16.numpy(), batch_out_dir / f"depth_b{b:03d}_t{t:03d}.png")
+        else:
+            raise ValueError(f"不支持的 depth 形状: {tuple(depth.shape)}")
 
 if __name__ == "__main__":
     main()

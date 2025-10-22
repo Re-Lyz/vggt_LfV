@@ -35,7 +35,7 @@ class C3VDDatasetv1(BaseDataset):
         len_test: int = 20,
 
         # 位姿方向：pose.txt 若是 c2w，则 assume_pose='c2w'；w2c 则 'w2c'
-        assume_pose: str = "w2c",
+        assume_pose: str = "c2w",
 
         # 深度单位（如毫米→米）
         depth_unit_scale: float = 100.0/65535.0,
@@ -189,11 +189,13 @@ class C3VDDatasetv1(BaseDataset):
             color_path = anno["color_path"]
 
             # 1) 读图（图像本身仍按实际尺寸加载；K 已按 common_conf 的 H,W 生成）
-            image = read_image_cv2(color_path)
+            image = read_image_cv2(color_path, rgb=False)
             if image is None:
                 # 这里最好打印一条可定位的信息，避免静默跳样本
                 print(f"[warn] fail to read image: {color_path}")
                 continue
+            
+            # save_image_and_depth(image, None, f"original_image_{i}.png", f"original_depth_{i}.png")
             
             # 2) 读深度（可选）并处理 occlusion
             if self.load_depth and osp.isfile(anno["depth_path"]):
@@ -203,8 +205,16 @@ class C3VDDatasetv1(BaseDataset):
                     if occ is not None:
                         depth_map[occ > 0] = 0.0
                 depth_map = threshold_depth_map(depth_map, max_percentile=98, min_percentile=-1)
+                
+                
+                # save_image_and_depth(None, depth_map, f"original_image_{i}.png", f"original_depth_{i}.png")
             else:
                 depth_map = None
+                
+
+            # import sys
+            # np.set_printoptions(threshold=sys.maxsize, precision=4)
+            # print("depth_map stats:", depth_map)
                 
             original_size = np.array(image.shape[:2])
 
@@ -213,6 +223,8 @@ class C3VDDatasetv1(BaseDataset):
             intri_opencv = np.array(anno["K"], dtype=np.float64)
             # print("shape of image before process_one_image:", image.shape)
             # 4) 统一预处理与点云
+            # check_camera_parameters(extri_opencv, intri_opencv)
+
             (image, depth_map, extri_opencv, intri_opencv,
              world_coords_points, cam_coords_points, point_mask, _) = self.process_one_image(
                 image=image,
@@ -223,26 +235,28 @@ class C3VDDatasetv1(BaseDataset):
                 target_image_shape=target_image_shape,
                 filepath=color_path
             )
-             
-            # === 关键：对所有会被 collate 的返回做 C 连续与 dtype 统一 ===
-            image = np.ascontiguousarray(image, dtype=np.uint8)  # 或 float32，视你的下游而定
-            if depth_map is None:
-                # 避免 None 参与 collate；按你的设计返回空阵或全 0，形状要一致
-                depth_map = np.zeros(target_image_shape, dtype=np.float32)
-            else:
-                depth_map = np.ascontiguousarray(depth_map, dtype=np.float32)
+            # check_camera_parameters(extri_opencv, intri_opencv)
+            # save_image_and_depth(image, depth_map, f"processed_image_{i}.png", f"processed_depth_{i}.png")
+            
+            # # === 关键：对所有会被 collate 的返回做 C 连续与 dtype 统一 ===
+            # image = np.ascontiguousarray(image, dtype=np.uint8)  # 或 float32，视你的下游而定
+            # if depth_map is None:
+            #     # 避免 None 参与 collate；按你的设计返回空阵或全 0，形状要一致
+            #     depth_map = np.zeros(target_image_shape, dtype=np.float32)
+            # else:
+            #     depth_map = np.ascontiguousarray(depth_map, dtype=np.float32)
 
-            extri_opencv = np.ascontiguousarray(extri_opencv, dtype=np.float32)
-            intri_opencv = np.ascontiguousarray(intri_opencv, dtype=np.float32)
+            # extri_opencv = np.ascontiguousarray(extri_opencv, dtype=np.float32)
+            # intri_opencv = np.ascontiguousarray(intri_opencv, dtype=np.float32)
 
-            # 点云/掩膜也要保证连续 & dtype 统一（float32 / uint8）
-            if world_coords_points is not None:
-                world_coords_points = np.ascontiguousarray(world_coords_points, dtype=np.float32)
-            if cam_coords_points is not None:
-                cam_coords_points = np.ascontiguousarray(cam_coords_points, dtype=np.float32)
-            if point_mask is not None:
-                point_mask = np.ascontiguousarray(point_mask, dtype=np.uint8)
-            # print("shape of image after process_one_image:", image.shape)
+            # # 点云/掩膜也要保证连续 & dtype 统一（float32 / uint8）
+            # if world_coords_points is not None:
+            #     world_coords_points = np.ascontiguousarray(world_coords_points, dtype=np.float32)
+            # if cam_coords_points is not None:
+            #     cam_coords_points = np.ascontiguousarray(cam_coords_points, dtype=np.float32)
+            # if point_mask is not None:
+            #     point_mask = np.ascontiguousarray(point_mask, dtype=np.uint8)
+            # # print("shape of image after process_one_image:", image.shape)
             
             images.append(image)
             depths.append(depth_map)
@@ -280,6 +294,78 @@ class C3VDDatasetv1(BaseDataset):
             ]
         # print(f"[C3VD] got_frames={len(images)} target={img_per_seq}")
         return batch
+
+
+
+def save_image_and_depth(image, depth_map, image_name, depth_name):
+    """
+    将图像和深度图保存到当前目录中。
+
+    Args:
+        image: 图像数据，通常是 BGR 或 RGB 格式。
+        depth_map: 深度图数据。
+        image_name: 保存图像的文件名。
+        depth_name: 保存深度图的文件名。
+    """
+    # 保存图像
+    path = os.getcwd()
+    save_path = os.path.join(path, "debugging_outputs")
+    os.makedirs(save_path, exist_ok=True)
+    if image is not None:
+        image_path = os.path.join(save_path, image_name)
+        cv2.imwrite(image_path, image)
+        print(f"Saved image to {image_path}")
+
+    # 保存深度图
+    if depth_map is not None:
+        depth_path = os.path.join(save_path, depth_name)
+        # 深度图通常是浮点类型，将其转换为适当的显示格式
+        depth_map = np.uint16(depth_map * 65535 / 100)  # 将深度图范围映射到 16 位
+        cv2.imwrite(depth_path, depth_map)
+        print(f"Saved depth map to {depth_path}")
+
+def check_camera_parameters(extri_opencv, intri_opencv):
+    # 检查内参尺寸
+    if intri_opencv.shape != (3, 3):
+        print("Warning: intri_opencv should be a 3x3 matrix.")
+        return False
+
+    # 检查外参尺寸
+    if extri_opencv.shape != (3, 4):
+        print("Warning: extri_opencv should be a 3x4 matrix.")
+        return False
     
+    # 检查数据类型
+    if not (extri_opencv.dtype == np.float64 or extri_opencv.dtype == np.float32):
+        print("Warning: extri_opencv should be of type np.float64 or np.float32.")
+        return False
+    if not (intri_opencv.dtype == np.float64 or intri_opencv.dtype == np.float32):
+        print("Warning: intri_opencv should be of type np.float64 or np.float32.")
+        return False
+
+    # 检查是否包含 NaN 或 Inf
+    if np.any(np.isnan(extri_opencv)) or np.any(np.isinf(extri_opencv)):
+        print("Warning: extri_opencv contains NaN or Inf values.")
+        return False
+    if np.any(np.isnan(intri_opencv)) or np.any(np.isinf(intri_opencv)):
+        print("Warning: intri_opencv contains NaN or Inf values.")
+        return False
+
+    # 检查内参矩阵的合理性（例如焦距应为正）
+    if not np.all(intri_opencv >= 0):
+        print("Warning: intri_opencv contains non-positive values.")
+        return False
+
+    # 检查外参的旋转矩阵部分是否正交
+    rotation_matrix = extri_opencv[:, :3]  # 提取旋转矩阵
+    if not np.allclose(rotation_matrix @ rotation_matrix.T, np.eye(3), atol=1e-6):
+        print("Warning: Rotation matrix in extri_opencv is not orthogonal.")
+        return False
+
+    print("Camera parameters are valid.")
+    return True
+
+
+
     
     

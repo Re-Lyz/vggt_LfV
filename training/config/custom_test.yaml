@@ -3,7 +3,7 @@ defaults:
   - _self_
   - eval: default
 
-exp_name: exp001
+exp_name: exptest
 img_size: 266
 num_workers: 8
 seed_value: 42
@@ -14,7 +14,7 @@ max_img_per_gpu: 20
 pretrained_vggt: True   # If True, load the pretrained weights on ImageNet22K
 
 limit_train_batches: 20
-limit_val_batches: 20
+limit_val_batches: 10
 
 
 data:
@@ -197,4 +197,4 @@ cuda:
 
 # test 专用配置
 test:
-  weights: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/exp001/ckpts/checkpoint.pt    # 例如: /path/to/checkpoint_latest.pt
+  weights: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/exp003/ckpts/checkpoint.pt    # 例如: /path/to/checkpoint_latest.pt
