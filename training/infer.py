@@ -25,16 +25,15 @@ from eval.depth import (
 from eval.evo_pose import evaluate_and_visualize_poses as eval_poses
 from trainer import Trainer
 from train_utils.general import copy_data_to_device
-from vggt.utils.pose_enc import extri_intri_to_pose_encoding
-from infer_utils import sort_batch_by_ids, merge_camera_results, save_batch_images, to_serializable
+from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
+from infer_utils import sort_batch_by_ids, merge_camera_results, save_batch_images, to_serializable, save_poses_xyzw_txt, save_depth_confidence_image, check_depth
 
 @torch.no_grad()
 def run_val_dump_and_eval_external(
     trainer: Trainer,
     out_dir: str,
     epoch_tag: str = "latest",
-    camera_cfg: dict | None = None,
-    depth_cfg: dict | None = None,
+    cfg: OmegaConf = None,
 ):
     """
     验证集逐 batch 前向 → 评估（相机+深度）→ 汇总并仅落盘 JSON（不返回）
@@ -44,17 +43,11 @@ def run_val_dump_and_eval_external(
     - 输出：每 batch 的可视化与指标 + 全局 metrics_summary.json
     """
     # 默认评估配置（可外部覆盖）
-    if camera_cfg is None:
-        camera_cfg = {
-            "align": ["sim3", "se3", "none"],
-            "quat_order": "xyzw",
-            "plot_align_mode": "sim3",
-            "plot_3d": True,
-            "rpe_delta": 1,
-            "rpe_delta_unit": "frames",
-        }
-    if depth_cfg is None:
-        depth_cfg = {"align": "median", "min_depth": 1e-3, "max_depth": 80.0}
+    if cfg is None:
+        raise ValueError("cfg 参数不能为空；请传入包含 camera_cfg 和 depth_cfg 的评估配置块")
+
+    camera_cfg = cfg.get("camera", {})
+    depth_cfg = cfg.get("depth", {})
 
     model = trainer.model
     model.eval()
@@ -142,7 +135,7 @@ def run_val_dump_and_eval_external(
                 pred_depth = pred_depth.unsqueeze(1)
             elif pred_depth.ndim != 4:
                 raise RuntimeError(f"不支持的 depth 形状：{pred_depth.shape}")
-            np.set_printoptions(threshold=np.inf, linewidth=np.inf)
+            # np.set_printoptions(threshold=np.inf, linewidth=np.inf)
             # print(" pred_depth ", pred_depth)
 
             gt_depth = batch.get("depths", None)
@@ -181,7 +174,42 @@ def run_val_dump_and_eval_external(
 
             
             depth = pred_depth
-            check_depth(depth, batch_out_dir)
+            if cfg.get("save_depth_img", False):
+                check_depth(depth, batch_out_dir)
+                
+            if cfg.get("save_pose_txt", False):
+                pred_extri, _ = pose_encoding_to_extri_intri(
+                    pose_encoding=pred_pose_enc,
+                    image_size_hw=(Hp_img, Wp_img),
+                    pose_encoding_type="absT_quaR_FoV",
+                    build_intrinsics=False,
+                )
+                
+                # print("pred_extri shape:", pred_extri.shape)
+                gt_extri, _ = pose_encoding_to_extri_intri(
+                    pose_encoding=gt_pose_enc,
+                    image_size_hw=(Hp_img, Wp_img),
+                    pose_encoding_type="absT_quaR_FoV",
+                    build_intrinsics=False,
+                )
+                # print("gt_extri shape:", gt_extri.shape)
+                save_poses_xyzw_txt(
+                    pred_extri,
+                    batch_out_dir / "pred_poses_xyzw.txt",
+                    assume_w2c=True,
+                )
+                save_poses_xyzw_txt(
+                    gt_extri,
+                    batch_out_dir / "gt_poses_xyzw.txt",
+                    assume_w2c=True,
+                )
+                
+            if cfg.get("save_depth_conf_img", False) and "depth_conf" in preds:
+                depth_conf = preds["depth_conf"]
+                save_depth_confidence_image(
+                    depth_conf,
+                    batch_out_dir,
+                )
 
 
             # === 保存本批使用的输入图像 ===
@@ -287,8 +315,7 @@ def main():
         raise KeyError("未找到 cfg.eval；请确认存在 config/eval/<name>.yaml 且传入 --eval_config。")
 
     eval_cfg = cfg.eval
-    camera_cfg = OmegaConf.to_container(eval_cfg.get("camera", {}), resolve=True)
-    depth_cfg  = OmegaConf.to_container(eval_cfg.get("depth",  {}), resolve=True)
+
 
     # out_dir 支持引用主 cfg 的字段（例如 ${exp_name}），Hydra 会在 compose 时解析
     out_dir   = eval_cfg.get("out_dir", f"outputs/eval/{cfg.get('exp_name', 'exp')}")
@@ -302,72 +329,38 @@ def main():
         trainer,
         out_dir=out_dir,
         epoch_tag=epoch_tag,
-        camera_cfg=camera_cfg,
-        depth_cfg=depth_cfg,
+        cfg=eval_cfg,
     )
 
 
-def save_image_and_depth(image, depth_map, image_name, depth_name):
-    """
-    将图像和深度图保存到当前目录中。
+# def save_image_and_depth(image, depth_map, image_name, depth_name):
+#     """
+#     将图像和深度图保存到当前目录中。
 
-    Args:
-        image: 图像数据，通常是 BGR 或 RGB 格式。
-        depth_map: 深度图数据。
-        image_name: 保存图像的文件名。
-        depth_name: 保存深度图的文件名。
-    """
-    # 保存图像
-    path = os.getcwd()
-    save_path = os.path.join(path, "debugging_outputs")
-    os.makedirs(save_path, exist_ok=True)
-    if image is not None:
-        image_path = os.path.join(save_path, image_name)
-        cv2.imwrite(image_path, image)
-        print(f"Saved image to {image_path}")
+#     Args:
+#         image: 图像数据，通常是 BGR 或 RGB 格式。
+#         depth_map: 深度图数据。
+#         image_name: 保存图像的文件名。
+#         depth_name: 保存深度图的文件名。
+#     """
+#     # 保存图像
+#     path = os.getcwd()
+#     save_path = os.path.join(path, "debugging_outputs")
+#     os.makedirs(save_path, exist_ok=True)
+#     if image is not None:
+#         image_path = os.path.join(save_path, image_name)
+#         cv2.imwrite(image_path, image)
+#         print(f"Saved image to {image_path}")
 
-    # 保存深度图
-    if depth_map is not None:
-        depth_path = os.path.join(save_path, depth_name)
-        # 深度图通常是浮点类型，将其转换为适当的显示格式
-        depth_map = np.uint16(depth_map * 65535 * 10)  # 将深度图范围映射到 16 位
-        cv2.imwrite(depth_path, depth_map)
-        print(f"Saved depth map to {depth_path}")
+#     # 保存深度图
+#     if depth_map is not None:
+#         depth_path = os.path.join(save_path, depth_name)
+#         # 深度图通常是浮点类型，将其转换为适当的显示格式
+#         depth_map = np.uint16(depth_map * 65535 * 10)  # 将深度图范围映射到 16 位
+#         cv2.imwrite(depth_path, depth_map)
+#         print(f"Saved depth map to {depth_path}")
         
-def check_depth(depth: torch.Tensor, batch_out_dir: Path):
-        batch_out_dir = batch_out_dir / "debug_depth"
-        depth = depth.detach().cpu().squeeze()
-        
-        depth = torch.nan_to_num(depth, nan=0.0, posinf=100, neginf=0.0)
-        import imageio.v2 as imageio
-        
-        def m_to_raw_u16(d: torch.Tensor) -> torch.Tensor:
-            raw = torch.round(d * 65535.0)
-            raw = torch.clamp(raw, 0, 65535)
-            return raw.to(torch.uint16)
 
-        def save_u16_png(arr_u16: np.ndarray, out_path: Path):
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            imageio.imwrite(out_path.as_posix(), arr_u16)
-
-        if depth.ndim == 2:
-            raw_u16 = m_to_raw_u16(depth)                     # (H, W)
-            save_u16_png(raw_u16.numpy(), batch_out_dir / f"depth.png")
-
-        elif depth.ndim == 3:
-            B = depth.shape[0]
-            for b in range(B):
-                raw_u16 = m_to_raw_u16(depth[b])              # (H, W)
-                save_u16_png(raw_u16.numpy(), batch_out_dir / f"depth_b{b:03d}.png")
-
-        elif depth.ndim == 4:
-            B, T = depth.shape[:2]
-            for b in range(B):
-                for t in range(T):
-                    raw_u16 = m_to_raw_u16(depth[b, t])       # (H, W)
-                    save_u16_png(raw_u16.numpy(), batch_out_dir / f"depth_b{b:03d}_t{t:03d}.png")
-        else:
-            raise ValueError(f"不支持的 depth 形状: {tuple(depth.shape)}")
 
 if __name__ == "__main__":
     main()

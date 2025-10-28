@@ -83,7 +83,7 @@ data:
       debug: False
       get_nearby: True
       load_depth: True
-      img_nums: [15, 15]
+      img_nums: [21, 21]
       allow_duplicate_img: False
 
       ocam:
@@ -93,6 +93,7 @@ data:
         cy: 543.975887548343
         a0: 769.243600037458
         a2: -0.000812770624150226
+
         a3: 6.25674244578925e-07
         a4: -1.19662182144280e-09
         e: 0.999986882249990

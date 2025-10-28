@@ -311,7 +311,7 @@ class Trainer:
         self.train_dataset = None
         self.val_dataset = None
 
-        if self.mode == "val":
+        if self.mode in ["val"]:
             ds_conf = self.data_conf.get("val", None)
             if ds_conf is not None:
                 self.val_dataset = instantiate(ds_conf, _recursive_=False)
@@ -319,7 +319,7 @@ class Trainer:
             return
 
         # --- TEST 模式（纯推理/评估）---
-        if self.mode == "test":
+        if self.mode in ["test"]:
             ds_conf = self.data_conf.get("test", None)
             if ds_conf is None:
                 ds_conf = self.data_conf.get("val", None)

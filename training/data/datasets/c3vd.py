@@ -31,8 +31,8 @@ class C3VDDatasetv1(BaseDataset):
         cameras=("cam0",),
         USE_REGISTERED: bool = True,
         min_num_images: int = 2,
-        len_train: int = 1000,
-        len_test: int = 20,
+        len_train: int = 100000,
+        len_test: int = 100,
 
         # 位姿方向：pose.txt 若是 c2w，则 assume_pose='c2w'；w2c 则 'w2c'
         assume_pose: str = "c2w",
@@ -109,7 +109,7 @@ class C3VDDatasetv1(BaseDataset):
                 continue
             
             seq_items = []
-            for cf in color_files:
+            for i_order, cf in enumerate(color_files):
                 bn = osp.basename(cf)
                 # 兼容 "3_color.png" / "0003_color.png"
                 idx_str = bn.split("_")[0]
@@ -133,6 +133,11 @@ class C3VDDatasetv1(BaseDataset):
                 depth_path   = osp.join(data_dir, f"{idx4}_depth.tiff")
                 normals_path = osp.join(data_dir, f"{idx4}_normals.tiff")
                 occ_path     = osp.join(data_dir, f"{idx4}_occlusion.png")
+
+                if not osp.isfile(cf):
+                    if self.debug:
+                        print(f"[Skip] color file not found: {cf}")
+                    continue    
 
                 seq_items.append(dict(
                     frame_idx=idx,
@@ -172,10 +177,21 @@ class C3VDDatasetv1(BaseDataset):
             seq_index = random.randint(0, self.sequence_list_len - 1)
         if seq_name is None:
             seq_name = self.sequence_list[seq_index]
+            
+        
 
         meta = self.data_store[seq_name]
+        # print("meta length:", len(meta))
         if ids is None:
             ids = np.random.choice(len(meta), img_per_seq, replace=self.allow_duplicate_img)
+
+            # N = len(meta)
+            # K = img_per_seq
+            # edges = np.linspace(0, N, num=K+1, dtype=int)
+            # ids = np.array([
+            #     np.random.randint(edges[i], max(edges[i] + 1, edges[i + 1]))
+            #     for i in range(K)
+            # ])
 
         target_image_shape = self.get_target_shape(aspect_ratio)
 
@@ -191,9 +207,7 @@ class C3VDDatasetv1(BaseDataset):
             # 1) 读图（图像本身仍按实际尺寸加载；K 已按 common_conf 的 H,W 生成）
             image = read_image_cv2(color_path, rgb=False)
             if image is None:
-                # 这里最好打印一条可定位的信息，避免静默跳样本
-                print(f"[warn] fail to read image: {color_path}")
-                continue
+                raise RuntimeError(f"Failed to read image: {color_path}")
             
             # save_image_and_depth(image, None, f"original_image_{i}.png", f"original_depth_{i}.png")
             
@@ -258,6 +272,10 @@ class C3VDDatasetv1(BaseDataset):
             #     point_mask = np.ascontiguousarray(point_mask, dtype=np.uint8)
             # # print("shape of image after process_one_image:", image.shape)
             
+            # print_array_info(depth_map, "depth_map")
+            # print_array_info(extri_opencv, "extri_opencv")
+            # print_array_info(intri_opencv, "intri_opencv")
+
             images.append(image)
             depths.append(depth_map)
             extrinsics.append(extri_opencv)
@@ -365,7 +383,14 @@ def check_camera_parameters(extri_opencv, intri_opencv):
     print("Camera parameters are valid.")
     return True
 
-
+def print_array_info(arr, name="Array"):
+    print(f"{name} Info:")
+    print(f"  - Shape: {arr.shape}")
+    print(f"  - Mean: {np.mean(arr)}")
+    print(f"  - Min: {np.min(arr)}")
+    print(f"  - Max: {np.max(arr)}")
+    print(f"  - Std: {np.std(arr)}")
+    print(f"  - Range: ({np.min(arr)}, {np.max(arr)})\n")
 
     
     

@@ -2,12 +2,11 @@
 from __future__ import annotations
 import os
 import json
-import random
 from pathlib import Path
 from typing import Any, Union
 import torch
-import torch.distributed as dist
-from datetime import timedelta
+from PIL import Image
+import imageio
 
 # 可选依赖：yaml（用于读取/写入配置）
 try:
@@ -29,47 +28,6 @@ except Exception:
 
 PathLike = Union[str, Path]
 
-
-
-def ensure_dir(path: PathLike) -> None:
-    """
-    确保目录存在（不存在则递归创建）。
-    """
-    Path(path).mkdir(parents=True, exist_ok=True)
-
-def dump_json(obj: Any, path: PathLike) -> None:
-    """
-    将对象以 JSON 写入到 path（会自动创建父目录）。
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-         
-_DTYPE_CAST = {
-    torch.bfloat16: torch.float32,  # numpy 不支持 bfloat16，先转 float32
-    torch.float16: torch.float32,   # 有些下游算子对 fp16 不稳
-}
-      
-def tensor_to_numpy(t) :
-    dt = _DTYPE_CAST.get(t.dtype, None)
-    if dt is not None:
-        t = t.to(dt)
-    return t.detach().cpu().numpy()
-
-def tree_to_numpy(x):
-    """仅把 torch.Tensor→numpy；保持原有 dict/list/tuple 结构；其他类型原样返回。"""
-    if torch.is_tensor(x):
-        return tensor_to_numpy(x)
-    if isinstance(x, dict):
-        return {k: tree_to_numpy(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        out = [tree_to_numpy(v) for v in x]
-        return tuple(out) if isinstance(x, tuple) else out
-    if isinstance(x, (np.ndarray, np.number, float, int, str)) or x is None:
-        return x
-    # 其他罕见类型（Path、bool、自定义类等）直接原样返回
-    return x
         
 def as_tensor(x, device):
     if isinstance(x, torch.Tensor):
@@ -163,8 +121,7 @@ def sort_batch_by_ids(batch: dict):
         batch["ids"] = torch.stack([ids[b, order_per_b[b]] for b in range(ids.shape[0])], dim=0).to(ids.dtype)
 
     return batch        
-        
-        
+             
 def merge_camera_results(all_res: list[dict]) -> dict:
     if not all_res:
         return {}
@@ -269,7 +226,6 @@ def to_uint8_chw(img_t):
         x = x.clamp(0,255).round()
     return x.to(torch.uint8)
 
-
 def save_batch_images(batch, out_dir: Path, rank: int):
     """
     将当前 batch 的图像保存到 out_dir/images 下。
@@ -362,6 +318,7 @@ def save_batch_images(batch, out_dir: Path, rank: int):
                 # 保存（RGB）
                 from PIL import Image
                 x_np = x.permute(1,2,0).numpy()  # [H,W,C]
+                x_np = x_np[..., ::-1]
                 Image.fromarray(x_np).save(img_dir / fn)
 
     else:
@@ -426,8 +383,6 @@ def save_batch_images(batch, out_dir: Path, rank: int):
                     from PIL import Image
                     Image.fromarray(x.permute(1,2,0).numpy()).save(img_dir / fn)
         
-
-
 def to_serializable(obj):
     """把 tensor/列表 等递归转成可 JSON 序列化的 Python 原生类型"""
     if isinstance(obj, torch.Tensor):
@@ -437,7 +392,237 @@ def to_serializable(obj):
     if isinstance(obj, dict):
         return {k: to_serializable(v) for k, v in obj.items()}
     return obj
-        
-        
-        
+          
+def debug_tensor_stats(x, name="tensor"):
+    """Utility function to print basic statistics of a tensor for debugging."""
+    print(f"Stats for {name}:")
+    print(f"x Shape: {x.shape}")
+    print(f"x Mean: {x.mean()}")
+    print(f"x Standard Deviation: {x.std()}")
+    print(f"x Min: {x.min()}")
+    print(f"x Max: {x.max()}")
+    print(f"x Sum: {x.sum()}")
+    print(f"x Variance: {x.var()}")
 
+def _rotmat_to_quat_xyzw(R):
+    """R: [3,3] → quat(x,y,z,w) with xyzw order."""
+    m = R
+    t = np.trace(m)
+    if t > 0.0:
+        s = np.sqrt(t + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (m[2,1] - m[1,2]) / s
+        qy = (m[0,2] - m[2,0]) / s
+        qz = (m[1,0] - m[0,1]) / s
+    else:
+        # find major diagonal
+        if m[0,0] > m[1,1] and m[0,0] > m[2,2]:
+            s = np.sqrt(1.0 + m[0,0] - m[1,1] - m[2,2]) * 2.0
+            qx = 0.25 * s
+            qy = (m[0,1] + m[1,0]) / s
+            qz = (m[0,2] + m[2,0]) / s
+            qw = (m[2,1] - m[1,2]) / s
+        elif m[1,1] > m[2,2]:
+            s = np.sqrt(1.0 + m[1,1] - m[0,0] - m[2,2]) * 2.0
+            qx = (m[0,1] + m[1,0]) / s
+            qy = 0.25 * s
+            qz = (m[1,2] + m[2,1]) / s
+            qw = (m[0,2] - m[2,0]) / s
+        else:
+            s = np.sqrt(1.0 + m[2,2] - m[0,0] - m[1,1]) * 2.0
+            qx = (m[0,2] + m[2,0]) / s
+            qy = (m[1,2] + m[2,1]) / s
+            qz = 0.25 * s
+            qw = (m[1,0] - m[0,1]) / s
+    q = np.array([qx, qy, qz, qw], dtype=np.float64)
+    q /= np.linalg.norm(q) + 1e-12
+    return q.astype(np.float32)
+
+def save_poses_xyzw_txt(extri_3x4, out_path: str, assume_w2c: bool = True):
+    """
+    将 [N,3,4] OpenCV w2c [R|t]（默认）保存为每行: x y z q_x q_y q_z q_w
+    - 如果输入已是 c2w，请设置 assume_w2c=False。
+    - 四元数顺序固定为 xyzw。
+    """
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    E = extri_3x4.squeeze().detach().float().cpu().numpy()  # [N,3,4]
+    rows = []
+    for i in range(E.shape[0]):
+        R = E[i, :3, :3]
+        t = E[i, :3, 3:4]  # shape [3,1]
+
+        if assume_w2c:
+            # c2w = [R^T | -R^T t]
+            Rc2w = R.T
+            tc2w = (-R.T @ t).reshape(3)
+        else:
+            Rc2w = R
+            tc2w = t.reshape(3)
+
+        q_xyzw = _rotmat_to_quat_xyzw(Rc2w)
+
+        vals = np.concatenate([tc2w.astype(np.float32), q_xyzw], axis=0)  # [7]
+        # 与你原来的格式化风格一致（去掉多余尾零/小数点）
+        parts = []
+        for v in vals:
+            s = f"{v:.6f}"
+            parts.append(s[:-1].rstrip("0").rstrip(".") if "." in s else s)
+        rows.append(" ".join(parts))
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(rows))
+    # print(f"[write] {out_path}  (poses={E.shape[0]})")
+    
+def check_depth(depth, batch_out_dir: Path):
+        batch_out_dir = batch_out_dir / "pred_depth"
+        depth = depth.detach().cpu().squeeze()
+        
+        depth = torch.nan_to_num(depth, nan=0.0, posinf=100, neginf=0.0)
+        import imageio.v2 as imageio
+        
+        def m_to_raw_u16(d):
+            raw = torch.round(d * 65535.0/5)
+            raw = torch.clamp(raw, 0, 65535)
+            return raw.to(torch.uint16)
+
+        def save_u16_png(arr_u16, out_path: Path):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            imageio.imwrite(out_path.as_posix(), arr_u16)
+
+        if depth.ndim == 2:
+            raw_u16 = m_to_raw_u16(depth)                     # (H, W)
+            save_u16_png(raw_u16.numpy(), batch_out_dir / f"depth.png")
+
+        elif depth.ndim == 3:
+            B = depth.shape[0]
+            for b in range(B):
+                raw_u16 = m_to_raw_u16(depth[b])              # (H, W)
+                save_u16_png(raw_u16.numpy(), batch_out_dir / f"depth_b{b:03d}.png")
+
+        elif depth.ndim == 4:
+            B, T = depth.shape[:2]
+            for b in range(B):
+                for t in range(T):
+                    raw_u16 = m_to_raw_u16(depth[b, t])       # (H, W)
+                    save_u16_png(raw_u16.numpy(), batch_out_dir / f"depth_b{b:03d}_t{t:03d}.png")
+        else:
+            raise ValueError(f"不支持的 depth 形状: {tuple(depth.shape)}")
+
+def save_depth_confidence_image(depth_conf, batch_out_dir: Path):
+    """
+    保存深度置信度图像（8位灰度图）。
+    
+    Args:
+        depth_conf (torch.Tensor): 深度置信度图像张量，形状可能是 [B, T, H, W] 或 [B, H, W]。
+        batch_out_dir (Path): 输出文件夹路径，用于保存图像。
+    """
+    batch_out_dir = batch_out_dir / "pred_depth_confidence"
+    depth_conf = depth_conf.detach().cpu().squeeze()
+
+    # 确保置信度图有效，处理 NaN 和无穷值
+    depth_conf = torch.nan_to_num(depth_conf, nan=0.0, posinf=1.0, neginf=0.0)
+
+    def m_to_raw_u8(conf):
+        """将置信度值转换为8位无符号整数"""
+        raw = torch.round(conf * 255.0)
+        raw = torch.clamp(raw, 0, 255)
+        return raw.to(torch.uint8)
+
+    def save_u8_png(arr_u8, out_path: Path):
+        """保存8位PNG图像"""
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        imageio.imwrite(out_path.as_posix(), arr_u8)
+
+    # 保存置信度图
+    if depth_conf.ndim == 2:
+        raw_u8 = m_to_raw_u8(depth_conf)  # (H, W)
+        save_u8_png(raw_u8.numpy(), batch_out_dir / f"depth_conf.png")
+
+    elif depth_conf.ndim == 3:
+        B = depth_conf.shape[0]
+        for b in range(B):
+            raw_u8 = m_to_raw_u8(depth_conf[b])  # (H, W)
+            save_u8_png(raw_u8.numpy(), batch_out_dir / f"depth_conf_b{b:03d}.png")
+
+    elif depth_conf.ndim == 4:
+        B, T = depth_conf.shape[:2]
+        for b in range(B):
+            for t in range(T):
+                raw_u8 = m_to_raw_u8(depth_conf[b, t])  # (H, W)
+                save_u8_png(raw_u8.numpy(), batch_out_dir / f"depth_conf_b{b:03d}_t{t:03d}.png")
+
+    else:
+        raise ValueError(f"不支持的 depth_conf 形状: {tuple(depth_conf.shape)}")
+    
+    
+    
+    
+    
+    
+
+# def save_extrinsics_4x4_txt(extri_3x4, out_path: str):
+#     """
+#     extri_3x4: [N,3,4] (torch) OpenCV w2c [R|t]
+#     保存为每行一个 4x4（行主序，最后一行 0 0 0 1）
+#     """
+#     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+#     E = extri_3x4.detach().float().cpu().numpy()   # [N,3,4]
+#     N = E.shape[0]
+#     rows = []
+#     for i in range(N):
+#         M = np.eye(4, dtype=np.float32)
+#         M[:3, :4] = E[i]
+#         rows.append(",".join(f"{v:.6f}".rstrip("0").rstrip(".") if "." in f"{v:.6f}" else f"{v:.6f}" 
+#                              for v in M.reshape(-1)))
+#     with open(out_path, "w", encoding="utf-8") as f:
+#         f.write("\n".join(rows))
+#     print(f"[write] {out_path}  (poses={N})")
+
+
+
+    
+    
+    
+# def ensure_dir(path: PathLike) -> None:
+#     """
+#     确保目录存在（不存在则递归创建）。
+#     """
+#     Path(path).mkdir(parents=True, exist_ok=True)
+
+# def dump_json(obj: Any, path: PathLike) -> None:
+#     """
+#     将对象以 JSON 写入到 path（会自动创建父目录）。
+#     """
+#     path = Path(path)
+#     path.parent.mkdir(parents=True, exist_ok=True)
+#     with open(path, "w", encoding="utf-8") as f:
+#         json.dump(obj, f, indent=2, ensure_ascii=False)
+ 
+
+
+    
+    
+# _DTYPE_CAST = {
+#     torch.bfloat16: torch.float32,  # numpy 不支持 bfloat16，先转 float32
+#     torch.float16: torch.float32,   # 有些下游算子对 fp16 不稳
+# }
+      
+# def tensor_to_numpy(t) :
+#     dt = _DTYPE_CAST.get(t.dtype, None)
+#     if dt is not None:
+#         t = t.to(dt)
+#     return t.detach().cpu().numpy()
+
+# def tree_to_numpy(x):
+#     """仅把 torch.Tensor→numpy；保持原有 dict/list/tuple 结构；其他类型原样返回。"""
+#     if torch.is_tensor(x):
+#         return tensor_to_numpy(x)
+#     if isinstance(x, dict):
+#         return {k: tree_to_numpy(v) for k, v in x.items()}
+#     if isinstance(x, (list, tuple)):
+#         out = [tree_to_numpy(v) for v in x]
+#         return tuple(out) if isinstance(x, tuple) else out
+#     if isinstance(x, (np.ndarray, np.number, float, int, str)) or x is None:
+#         return x
+#     # 其他罕见类型（Path、bool、自定义类等）直接原样返回
+#     return x

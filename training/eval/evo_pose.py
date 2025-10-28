@@ -7,7 +7,7 @@ import json, os
 import torch
 import matplotlib.pyplot as plt
 os.environ.setdefault("MPLBACKEND", "Agg")
-
+from evo.core.metrics import APE, RPE, PoseRelation
 try:
     from evo.core.metrics import  Unit
     EVO_AVAILABLE = True
@@ -204,7 +204,7 @@ def evaluate_and_visualize_poses(
     gt_c2w   = gt_c2w[:S]
 
     # 转 evo 轨迹
-    from evo.core.metrics import APE, RPE, PoseRelation
+
     traj_pred = _c2w_to_evo_traj(pred_c2w)
     traj_gt   = _c2w_to_evo_traj(gt_c2w)
 

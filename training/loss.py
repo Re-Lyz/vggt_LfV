@@ -102,11 +102,14 @@ def compute_camera_loss(
     gt_extrinsics = batch_data['extrinsics']
     gt_intrinsics = batch_data['intrinsics']
     image_hw = batch_data['images'].shape[-2:]
+    # print(image_hw)
 
     # Encode ground truth pose to match predicted encoding format
     gt_pose_encoding = extri_intri_to_pose_encoding(
         gt_extrinsics, gt_intrinsics, image_hw, pose_encoding_type=pose_encoding_type
     )
+    # debug_tensor_stats(gt_pose_encoding, "gt_pose_encoding")
+    
 
     # Initialize loss accumulators for translation, rotation, focal length
     total_loss_T = total_loss_R = total_loss_FL = 0
@@ -255,6 +258,7 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     gt_depth = check_and_fix_inf_nan(gt_depth, "gt_depth")
     gt_depth = gt_depth[..., None]              # (B, H, W, 1)
     gt_depth_mask = batch['point_masks'].clone()   # 3D points derived from depth map, so we use the same mask
+    # debug_tensor_stats(gt_depth, "gt_depth")
 
     if gt_depth_mask.sum() < 100:
         # If there are less than 100 valid points, skip this batch
@@ -682,6 +686,19 @@ def torch_quantile(
 
 ########################################################################################
 ########################################################################################
+def debug_tensor_stats(x, name="tensor"):
+    """Utility function to print basic statistics of a tensor for debugging."""
+    print(f"Stats for {name}:")
+    print(f"x Shape: {x.shape}")
+    print(f"x Mean: {x.mean()}")
+    print(f"x Standard Deviation: {x.std()}")
+    print(f"x Min: {x.min()}")
+    print(f"x Max: {x.max()}")
+    print(f"x Sum: {x.sum()}")
+    print(f"x Variance: {x.var()}")
+
+    
+    
 
 '''
 def _compute_losses(self, coord_preds, vis_scores, conf_scores, batch):

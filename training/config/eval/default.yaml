@@ -21,3 +21,12 @@ depth:
   align: median                # 可选：lsq / mean / none
   min_depth: 0.001
   max_depth: 100.0
+
+# 是否保存pose的txt文件（默认 False）
+save_pose_txt: true  # 控制是否保存pose的txt文件
+
+# 是否保存深度置信图的可视化（默认 False）
+save_depth_conf_img: true  # 控制是否保存深度置信图的可视化图
+
+# 是否保存深度图像（默认 False）
+save_depth_img: true  # 控制是否保存深度图像
