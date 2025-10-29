@@ -3,7 +3,7 @@ defaults:
   - _self_
   - eval: default
 
-exp_name: expcol001
+exp_name: expcol002
 img_size: 266
 num_workers: 8
 seed_value: 42
@@ -14,7 +14,7 @@ max_img_per_gpu: 20
 pretrained_vggt: True   # If True, load the pretrained weights on ImageNet22K
 
 limit_train_batches: 1000
-limit_val_batches: 50
+limit_val_batches: 20
 
 
 data:
@@ -91,7 +91,7 @@ logging:
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 5
-  resume_checkpoint_path: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/checkpoint.pt
+  resume_checkpoint_path: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/expcol001/ckpts/checkpoint.pt
   strict: False
 
 pretrained:

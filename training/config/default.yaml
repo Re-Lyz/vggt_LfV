@@ -3,7 +3,7 @@ defaults:
   - _self_
   - eval: default
   
-exp_name: exp001
+exp_name: expco3d
 img_size: 518
 num_workers: 8
 seed_value: 42
@@ -30,10 +30,11 @@ data:
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.c3vd.C3VDDatasetv1
+        - _target_: data.datasets.co3d.Co3dDataset
           split: train
-          ROOT: /YOUR/PATH/TO/C3VD
-          USE_REGISTERED: True
+          CO3D_DIR: /data/co3d
+          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+
           
 
   val:
@@ -47,8 +48,10 @@ data:
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.c3vd.C3VDDatasetv1
+        - _target_: data.datasets.co3d.Co3dDataset
           split: test
+          CO3D_DIR: /data/co3d
+          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
 
 
 logging:
@@ -88,9 +91,17 @@ logging:
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 5
-  resume_checkpoint_path: /YOUR/PATH/TO/CKPT
+  resume_checkpoint_path: null
   strict: False
 
+
+pretrained:
+  enable: true
+  source: "huggingface"
+  hf_repo: "facebook/VGGT-1B"
+  local_files_only: true
+  only_matching: true
+  ignore_missing: true
 
 loss:
   _target_: loss.MultitaskLoss

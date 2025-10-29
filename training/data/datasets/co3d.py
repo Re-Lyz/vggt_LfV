@@ -73,7 +73,7 @@ class Co3dDataset(BaseDataset):
         CO3D_ANNOTATION_DIR: str = None,
         min_num_images: int = 24,
         len_train: int = 100000,
-        len_test: int = 10000,
+        len_test: int = 10,
     ):
         """
         Initialize the Co3dDataset.

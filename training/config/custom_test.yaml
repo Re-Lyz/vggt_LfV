@@ -3,7 +3,7 @@ defaults:
   - _self_
   - eval: default
 
-exp_name: expcol001
+exp_name: expcol001_test
 img_size: 266
 num_workers: 8
 seed_value: 42
@@ -49,7 +49,7 @@ data:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
         - _target_: data.datasets.c3vd.C3VDDatasetv1
-          ROOT: /data/C3VD/C3VDv1/registered
+          ROOT: /data/C3VD/C3VDv1/test_registered
           split: test
           USE_REGISTERED: False
 
@@ -198,4 +198,4 @@ cuda:
 
 # test 专用配置
 test:
-  weights: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/exp006/ckpts/checkpoint.pt     # 例如: /path/to/checkpoint_latest.pt
+  weights: /home/ubuntu/vggt_LfV_Lyz/vggt_LfV/training/logs/expcol001/ckpts/checkpoint.pt     # 例如: /path/to/checkpoint_latest.pt
